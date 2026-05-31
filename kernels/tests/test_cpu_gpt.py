@@ -223,6 +223,7 @@ def test_optional_native_libxsmm_post_op_chain_smoke(monkeypatch) -> None:
         pytest.skip("LIBXSMM headers/libs are not available")
 
     monkeypatch.setenv("CODA_CPU_PROVIDER", LibxsmmProvider.name)
+    monkeypatch.setenv("CODA_LIBXSMM_DENSE_MIN_FLOPS", "1")
     provider = select_provider()
     assert provider.name == LibxsmmProvider.name
 

@@ -3,6 +3,7 @@
 #include <ATen/Parallel.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -41,6 +42,44 @@ int64_t choose_n_tile(int64_t remaining) {
 
 int64_t choose_k_tile(int64_t remaining) {
     return remaining >= 128 ? 128 : std::min<int64_t>(remaining, 64);
+}
+
+int64_t env_i64(const char *name, int64_t fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    return end != value && parsed > 0 ? static_cast<int64_t>(parsed) : fallback;
+}
+
+bool env_enabled(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return value[0] != '0';
+}
+
+int64_t brgemm_k_tile(int64_t K) {
+    const int64_t requested = env_i64("CODA_LIBXSMM_BR_K_TILE", 128);
+    if (requested <= 0 || K % requested != 0) {
+        return 0;
+    }
+    return requested;
+}
+
+bool use_dense_sgemm(int64_t M, int64_t K, int64_t N) {
+    if (!env_enabled("CODA_LIBXSMM_DENSE_SGEMM", true)) {
+        return false;
+    }
+    const int64_t min_flops = env_i64("CODA_LIBXSMM_DENSE_MIN_FLOPS", 32LL * 1024LL * 1024LL);
+    return 2LL * M * K * N >= min_flops;
+}
+
+bool use_dense_omp() {
+    return env_enabled("CODA_LIBXSMM_DENSE_OMP", true);
 }
 
 std::vector<int64_t> build_tiles(int64_t extent, int64_t (*choose_tile)(int64_t)) {
@@ -123,6 +162,57 @@ std::once_flag libxsmm_init_once;
 std::mutex kernel_cache_mutex;
 std::unordered_map<KernelKey, libxsmm_smmfunction, KernelKeyHash> kernel_cache;
 
+struct BrgemmKey {
+    int m;
+    int n;
+    int k;
+    int lda;
+    int ldb;
+    int ldc;
+    int stride_a;
+    int stride_b;
+    int beta;
+    int br_count;
+    uint64_t post_op_signature;
+
+    bool operator==(const BrgemmKey &other) const {
+        return std::tie(m, n, k, lda, ldb, ldc, stride_a, stride_b, beta, br_count, post_op_signature) ==
+                std::tie(
+                        other.m,
+                        other.n,
+                        other.k,
+                        other.lda,
+                        other.ldb,
+                        other.ldc,
+                        other.stride_a,
+                        other.stride_b,
+                        other.beta,
+                        other.br_count,
+                        other.post_op_signature);
+    }
+};
+
+struct BrgemmKeyHash {
+    size_t operator()(const BrgemmKey &key) const {
+        uint64_t seed = 0;
+        seed = hash_combine(seed, static_cast<uint64_t>(key.m));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.n));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.k));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.lda));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.ldb));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.ldc));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.stride_a));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.stride_b));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.beta));
+        seed = hash_combine(seed, static_cast<uint64_t>(key.br_count));
+        seed = hash_combine(seed, key.post_op_signature);
+        return static_cast<size_t>(seed);
+    }
+};
+
+std::mutex brgemm_kernel_cache_mutex;
+std::unordered_map<BrgemmKey, libxsmm_smmfunction_reducebatch_strd, BrgemmKeyHash> brgemm_kernel_cache;
+
 libxsmm_smmfunction dispatch_smm_kernel(const KernelKey &key) {
     std::call_once(libxsmm_init_once, []() { libxsmm_init(); });
 
@@ -158,6 +248,118 @@ libxsmm_smmfunction dispatch_smm_kernel(const KernelKey &key) {
     return fn;
 }
 
+libxsmm_smmfunction_reducebatch_strd dispatch_brgemm_kernel(const BrgemmKey &key) {
+    std::call_once(libxsmm_init_once, []() { libxsmm_init(); });
+
+    std::lock_guard<std::mutex> guard(brgemm_kernel_cache_mutex);
+    auto it = brgemm_kernel_cache.find(key);
+    if (it != brgemm_kernel_cache.end()) {
+        return it->second;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = key.beta ? 1.0f : 0.0f;
+    const libxsmm_blasint m = static_cast<libxsmm_blasint>(key.m);
+    const libxsmm_blasint n = static_cast<libxsmm_blasint>(key.n);
+    const libxsmm_blasint k = static_cast<libxsmm_blasint>(key.k);
+    const libxsmm_blasint lda = static_cast<libxsmm_blasint>(key.lda);
+    const libxsmm_blasint ldb = static_cast<libxsmm_blasint>(key.ldb);
+    const libxsmm_blasint ldc = static_cast<libxsmm_blasint>(key.ldc);
+    const libxsmm_blasint stride_a = static_cast<libxsmm_blasint>(key.stride_a);
+    const libxsmm_blasint stride_b = static_cast<libxsmm_blasint>(key.stride_b);
+    const libxsmm_blasint br_count = static_cast<libxsmm_blasint>(key.br_count);
+    const int flags = LIBXSMM_GEMM_FLAG_NONE;
+    const int prefetch = LIBXSMM_PREFETCH_NONE;
+
+    auto fn = libxsmm_smmdispatch_reducebatch_strd_unroll(
+            m,
+            n,
+            k,
+            stride_a,
+            stride_b,
+            br_count,
+            &lda,
+            &ldb,
+            &ldc,
+            &alpha,
+            &beta,
+            &flags,
+            &prefetch);
+    brgemm_kernel_cache.emplace(key, fn);
+    return fn;
+}
+
+at::Tensor libxsmm_dense_accumulate(
+        const at::Tensor &A,
+        const at::Tensor &B) {
+    const int64_t M = A.size(0);
+    const int64_t K = A.size(1);
+    const int64_t N = B.size(1);
+    auto C = at::empty({M, N}, A.options().dtype(at::kFloat));
+
+    const char trans = 'N';
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const libxsmm_blasint cm = static_cast<libxsmm_blasint>(N);
+    const libxsmm_blasint cn = static_cast<libxsmm_blasint>(M);
+    const libxsmm_blasint ck = static_cast<libxsmm_blasint>(K);
+    const libxsmm_blasint lda = static_cast<libxsmm_blasint>(N);
+    const libxsmm_blasint ldb = static_cast<libxsmm_blasint>(K);
+    const libxsmm_blasint ldc = static_cast<libxsmm_blasint>(N);
+
+    if (use_dense_omp()) {
+#if defined(CODA_CPU_WITH_LIBXSMMEXT)
+        libxsmm_xgemm_omp(
+                LIBXSMM_GEMM_PRECISION_F32,
+                LIBXSMM_GEMM_PRECISION_F32,
+                &trans,
+                &trans,
+                &cm,
+                &cn,
+                &ck,
+                &alpha,
+                B.data_ptr<float>(),
+                &lda,
+                A.data_ptr<float>(),
+                &ldb,
+                &beta,
+                C.data_ptr<float>(),
+                &ldc);
+#else
+        libxsmm_sgemm(
+                &trans,
+                &trans,
+                &cm,
+                &cn,
+                &ck,
+                &alpha,
+                B.data_ptr<float>(),
+                &lda,
+                A.data_ptr<float>(),
+                &ldb,
+                &beta,
+                C.data_ptr<float>(),
+                &ldc);
+#endif
+    } else {
+        libxsmm_sgemm(
+                &trans,
+                &trans,
+                &cm,
+                &cn,
+                &ck,
+                &alpha,
+                B.data_ptr<float>(),
+                &lda,
+                A.data_ptr<float>(),
+                &ldb,
+                &beta,
+                C.data_ptr<float>(),
+                &ldc);
+    }
+    return C;
+}
+
 at::Tensor libxsmm_accumulate(
         const at::Tensor &A,
         const at::Tensor &B,
@@ -182,6 +384,10 @@ at::Tensor libxsmm_accumulate(
         return at::zeros({M, N}, A.options().dtype(at::kFloat));
     }
 
+    if (use_dense_sgemm(M, K, N)) {
+        return libxsmm_dense_accumulate(A, B);
+    }
+
     auto C = at::empty({M, N}, A.options().dtype(at::kFloat));
     const auto m_tiles = build_tiles(M, choose_m_tile);
     const auto n_tiles = build_tiles(N, choose_n_tile);
@@ -191,6 +397,11 @@ at::Tensor libxsmm_accumulate(
     const float *a_base = A.data_ptr<float>();
     const float *b_base = B.data_ptr<float>();
     float *c_base = C.data_ptr<float>();
+    const int64_t br_k_tile = brgemm_k_tile(K);
+    const bool use_brgemm =
+            env_enabled("CODA_LIBXSMM_USE_BRGEMM", false) &&
+            br_k_tile > 0 &&
+            K >= br_k_tile * 2;
 
     at::parallel_for(0, total_tiles, 1, [&](int64_t begin, int64_t end) {
         for (int64_t tile = begin; tile < end; ++tile) {
@@ -200,6 +411,34 @@ at::Tensor libxsmm_accumulate(
             const int64_t n0 = n_tiles[n_index];
             const int64_t mt = std::min<int64_t>(choose_m_tile(M - m0), M - m0);
             const int64_t nt = std::min<int64_t>(choose_n_tile(N - n0), N - n0);
+
+            if (use_brgemm) {
+                const int64_t br_count = K / br_k_tile;
+                const BrgemmKey key{
+                        static_cast<int>(nt),
+                        static_cast<int>(mt),
+                        static_cast<int>(br_k_tile),
+                        static_cast<int>(N),
+                        static_cast<int>(K),
+                        static_cast<int>(N),
+                        static_cast<int>(br_k_tile * N * static_cast<int64_t>(sizeof(float))),
+                        static_cast<int>(br_k_tile * static_cast<int64_t>(sizeof(float))),
+                        0,
+                        static_cast<int>(br_count),
+                        post_op_signature,
+                };
+                auto fn = dispatch_brgemm_kernel(key);
+                if (fn == nullptr) {
+                    throw std::runtime_error("LIBXSMM failed to dispatch an fp32 strided BRGEMM kernel");
+                }
+
+                const float *b_tile = b_base + n0;
+                const float *a_tile = a_base + m0 * K;
+                float *c_tile = c_base + m0 * N + n0;
+                const unsigned long long count = static_cast<unsigned long long>(br_count);
+                fn(b_tile, a_tile, c_tile, &count);
+                continue;
+            }
 
             for (int64_t k0 = 0; k0 < K;) {
                 const int64_t kt = std::min<int64_t>(choose_k_tile(K - k0), K - k0);

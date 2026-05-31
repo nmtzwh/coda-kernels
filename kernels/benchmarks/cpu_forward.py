@@ -89,6 +89,8 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--providers", nargs="+", default=["aten", "onednn-x64-brgemm", "libxsmm"])
+    parser.add_argument("--skip-compiled", action="store_true")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
@@ -103,10 +105,15 @@ def main() -> None:
         "torch-native/gemm_rmsnorm": lambda: _torch_native_gemm_rmsnorm(A, B, R),
         "torch-native/gemm_rmsnorm_swiglu": lambda: _torch_native_gemm_rmsnorm_swiglu(A, B, R),
         "torch-native/gemm_rmsnorm_rope": lambda: _torch_native_gemm_rmsnorm_rope(A, B, R, cos_sin),
-        "torch-compiled/gemm_rmsnorm": lambda: ref_gpt.gemm_rmsnorm(A, B, R),
-        "torch-compiled/gemm_rmsnorm_swiglu": lambda: ref_gpt.gemm_rmsnorm_swiglu(A, B, R),
-        "torch-compiled/gemm_rmsnorm_rope": lambda: ref_gpt.gemm_rmsnorm_rope(A, B, R, cos_sin),
     }
+    if not args.skip_compiled:
+        torch_cases.update(
+            {
+                "torch-compiled/gemm_rmsnorm": lambda: ref_gpt.gemm_rmsnorm(A, B, R),
+                "torch-compiled/gemm_rmsnorm_swiglu": lambda: ref_gpt.gemm_rmsnorm_swiglu(A, B, R),
+                "torch-compiled/gemm_rmsnorm_rope": lambda: ref_gpt.gemm_rmsnorm_rope(A, B, R, cos_sin),
+            }
+        )
     for name, fn in torch_cases.items():
         cold_ms = _time_once(fn)
         median_ms = _bench(fn, warmup=args.warmup, repeats=args.repeats)
@@ -117,7 +124,7 @@ def main() -> None:
         "gemm_rmsnorm_swiglu": lambda: cpu_gpt.gemm_rmsnorm_swiglu(A, B, R),
         "gemm_rmsnorm_rope": lambda: cpu_gpt.gemm_rmsnorm_rope(A, B, R, cos_sin),
     }
-    for provider in ("aten", "onednn-x64-brgemm", "libxsmm"):
+    for provider in args.providers:
         try:
             select_provider(provider)
         except RuntimeError as exc:
