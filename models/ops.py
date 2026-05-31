@@ -1,25 +1,126 @@
 import torch
-import triton
 from typing import NamedTuple
 from einops import rearrange, reduce
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
-from quack.autotuner import autotune, AutotuneConfig
-from quack.cross_entropy import cross_entropy as quack_cross_entropy
-from quack.rms_final_reduce import rms_final_reduce as quack_rms_final_reduce
+try:
+    import triton
+except Exception:
+    class _TritonCompat:
+        @staticmethod
+        def cdiv(x: int, y: int) -> int:
+            return (x + y - 1) // y
+
+    triton = _TritonCompat()
+
+try:
+    from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+except Exception:
+    def input_guard(fn):
+        return fn
+
+    def autocast_custom_fwd(fn):
+        return fn
+
+    def autocast_custom_bwd(fn):
+        return fn
+
+try:
+    from quack.autotuner import autotune, AutotuneConfig
+except Exception:
+    class AutotuneConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    def _default_autotune_config(configs):
+        for autotune_config in configs:
+            config = autotune_config.kwargs.get("config")
+            if config is None:
+                continue
+            values = getattr(config, "_asdict", lambda: {})()
+            block_sizes = [
+                value for name, value in values.items()
+                if name.startswith("block_size")
+            ]
+            has_128_blocks = bool(block_sizes) and all(
+                value == 128
+                for value in block_sizes
+            )
+            uses_quack = any(
+                name.startswith("use_quack") and value
+                for name, value in values.items()
+            )
+            if has_128_blocks and not uses_quack:
+                return config
+        for autotune_config in configs:
+            config = autotune_config.kwargs.get("config")
+            if config is None:
+                continue
+            values = getattr(config, "_asdict", lambda: {})()
+            uses_quack = any(
+                name.startswith("use_quack") and value
+                for name, value in values.items()
+            )
+            if not uses_quack:
+                return config
+        return configs[0].kwargs["config"]
+
+    def autotune(configs, key, cache_results=False):
+        def decorator(fn):
+            def wrapper(*args, **kwargs):
+                kwargs.setdefault("config", _default_autotune_config(configs))
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+try:
+    from quack.cross_entropy import cross_entropy as quack_cross_entropy
+    from quack.rms_final_reduce import rms_final_reduce as quack_rms_final_reduce
+except Exception:
+    def quack_cross_entropy(*args, **kwargs):
+        raise RuntimeError("quack is unavailable")
+
+    def quack_rms_final_reduce(*args, **kwargs):
+        raise RuntimeError("quack is unavailable")
+
+if not hasattr(torch, "compile"):
+    def _compile_compat(*args, **kwargs):
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+    torch.compile = _compile_compat
 
 from kernels.refs.gpt import rope as rope_interleaved
 # `gpt2` is more optimized and less precise
 from kernels.refs import gpt2 as kernels_torch
-from kernels.gens import gpt as kernels_rapier
-from kernels.tests import gpt as kernels_rapier_test
-from kernels.benchmarks import trainstation_utils
+from kernels.cpu import gpt as kernels_cpu
+
+try:
+    from kernels.gens import gpt as kernels_rapier
+except Exception:
+    kernels_rapier = None
+
+try:
+    from kernels.tests import gpt as kernels_rapier_test
+except Exception:
+    kernels_rapier_test = None
+
+try:
+    from kernels.benchmarks import trainstation_utils
+except Exception:
+    trainstation_utils = None
 
 
 _KERNELS = {
     "torch": kernels_torch,
-    "rapier": kernels_rapier,
-    "rapier-test": kernels_rapier_test,
+    "cpu": kernels_cpu,
 }
+if kernels_rapier is not None:
+    _KERNELS["rapier"] = kernels_rapier
+if kernels_rapier_test is not None:
+    _KERNELS["rapier-test"] = kernels_rapier_test
 
 
 class BlockSizeConfig(NamedTuple):
@@ -131,7 +232,17 @@ BlockSizeConfig3PostBwdOptions = [
 ]
 
 
-@torch.library.triton_op("rapier_ops::attn_bwd_rope_patch_quack", mutates_args={})
+def _optional_triton_op(name: str, mutates_args: set):
+    triton_op = getattr(torch.library, "triton_op", None)
+    if triton_op is None:
+        def decorator(fn):
+            return fn
+
+        return decorator
+    return triton_op(name, mutates_args=mutates_args)
+
+
+@_optional_triton_op("rapier_ops::attn_bwd_rope_patch_quack", mutates_args={})
 def _attn_bwd_rope_patch_quack(
     z: torch.Tensor,
     dy: torch.Tensor,
@@ -141,6 +252,8 @@ def _attn_bwd_rope_patch_quack(
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `zdz` is already reduced, and we rotates by -theta, hence `-sin`
+    if trainstation_utils is None:
+        raise RuntimeError("trainstation utilities are unavailable")
     return trainstation_utils.rope_bwd_zdz(
         z=z,
         dy=dy,
@@ -292,6 +405,8 @@ def rmsnorm_gemm_rope_fwd(
     backend: str,
     use_quack: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if backend == "cpu" or x.device.type == "cpu":
+        use_quack = False
     B, T, _ = x.shape
     D0, D1 = w.shape
     assert x.shape == (B, T, D0)
@@ -385,6 +500,8 @@ def gemm_residual_rmsnorm_gemm_fwd(
            torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
            torch.Tensor,
            torch.Tensor]:
+    if backend == "cpu" or x.device.type == "cpu":
+        use_quack = False
 
     B, T, D0 = y.shape
     D1, D2 = w_b.shape
@@ -498,7 +615,7 @@ def _gemm_residual_rmsnorm_gemm_fwd_tunable(
             logits_tgt=rearrange(logits_tgt, "b t -> (b t)", b=B, t=T),
             logits_lse=rearrange(logits_lse, "b t nb -> (b t) nb", b=B, t=T, nb=NB),
             targets=rearrange(targets, "b t -> (b t)", b=B, t=T),
-            use_quack=config.use_quack1,
+            use_quack=False if backend == "cpu" or targets.device.type == "cpu" else config.use_quack1,
         )
         return x_out, loss, z_out, rstd_out
     else:
