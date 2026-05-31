@@ -49,15 +49,22 @@ def _rope(x: torch.Tensor, cos_sin: torch.Tensor, backward: bool = False) -> tor
         raise ValueError(f"RoPE expects an even last dimension, got {x.shape[-1]}")
 
     sign = -1.0 if backward else 1.0
-    x2 = _to_acc(x).reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
+    x_acc = _to_acc(x)
+    x2 = x_acc.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
     cs2 = _to_acc(cos_sin).reshape(*cos_sin.shape[:-1], cos_sin.shape[-1] // 2, 2)
     x0 = x2[..., 0]
     x1 = x2[..., 1]
     cos = cs2[..., 0]
     sin = cs2[..., 1] * sign
-    y0 = x0 * cos + x1 * sin
-    y1 = x0 * (-sin) + x1 * cos
-    return torch.stack((y0, y1), dim=-1).reshape_as(x)
+    out = x_acc.new_empty(x_acc.shape)
+    out2 = out.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
+    y0 = out2[..., 0]
+    y1 = out2[..., 1]
+    torch.mul(x0, cos, out=y0)
+    y0.addcmul_(x1, sin)
+    torch.mul(x1, cos, out=y1)
+    y1.addcmul_(x0, sin, value=-1.0)
+    return out
 
 
 def _swiglu(x: torch.Tensor) -> torch.Tensor:
@@ -66,7 +73,11 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
     x2 = _to_acc(x).reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
     gate = x2[..., 0]
     up = x2[..., 1]
-    return torch.nn.functional.silu(gate) * up
+    out = gate.new_empty(gate.shape)
+    torch.sigmoid(gate, out=out)
+    out.mul_(gate)
+    out.mul_(up)
+    return out
 
 
 @dataclass(frozen=True)
@@ -131,6 +142,65 @@ class CpuGemmProvider:
         B: torch.Tensor,
         **tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if (
+            len(program.nodes) == 3
+            and program.nodes[0].op == EpilogueOp.RESIDUAL_ADD
+            and program.nodes[1].op == EpilogueOp.BLOCK_MEAN_SQUARE_REDUCTION
+            and program.nodes[2].op == EpilogueOp.ROW_VECTOR_SCALE_SIDE_OUTPUT
+        ):
+            c = _to_acc(tensors[_require_name(program.nodes[0].tensor)])
+            w = _col_view(tensors[_require_name(program.nodes[2].tensor)])
+            block_size = program.nodes[1].block_size
+            if block_size is None:
+                raise ValueError("block mean-square reduction requires block_size")
+            acc = torch.addmm(c, _to_acc(A), _to_acc(B))
+            if acc.shape[1] % block_size != 0:
+                raise ValueError(f"N={acc.shape[1]} must be divisible by block_size={block_size}")
+            side_outputs = {
+                _require_name(program.nodes[1].output): (
+                    acc.square()
+                    .reshape(acc.shape[0], _ceil_div(acc.shape[1], block_size), block_size)
+                    .mean(dim=-1)
+                ),
+                _require_name(program.nodes[2].output): acc * w,
+            }
+            output_dtype = program.output_dtype or A.dtype
+            return acc.to(dtype=output_dtype), side_outputs
+
+        if len(program.nodes) == 1 and program.nodes[0].op == EpilogueOp.ROW_SCALE:
+            acc = self.matmul_accumulate(A, B)
+            acc.mul_(_row_view(tensors[_require_name(program.nodes[0].tensor)]))
+            output_dtype = program.output_dtype or A.dtype
+            return acc.to(dtype=output_dtype), {}
+
+        if (
+            len(program.nodes) == 2
+            and program.nodes[0].op == EpilogueOp.ROW_SCALE
+            and program.nodes[1].op == EpilogueOp.SWIGLU
+        ):
+            acc = self.matmul_accumulate(A, B)
+            acc.mul_(_row_view(tensors[_require_name(program.nodes[0].tensor)]))
+            side_outputs = {_require_name(program.nodes[1].output): _swiglu(acc)}
+            output_dtype = program.output_dtype or A.dtype
+            return acc.to(dtype=output_dtype), side_outputs
+
+        if (
+            len(program.nodes) == 2
+            and program.nodes[0].op == EpilogueOp.ROW_SCALE
+            and program.nodes[1].op == EpilogueOp.ROPE
+        ):
+            acc = self.matmul_accumulate(A, B)
+            acc.mul_(_row_view(tensors[_require_name(program.nodes[0].tensor)]))
+            side_outputs = {
+                _require_name(program.nodes[1].output): _rope(
+                    acc,
+                    tensors[_require_name(program.nodes[1].tensor)],
+                    backward=program.nodes[1].backward,
+                )
+            }
+            output_dtype = program.output_dtype or A.dtype
+            return acc.to(dtype=output_dtype), side_outputs
+
         acc = self.matmul_accumulate(A, B)
         side_outputs: dict[str, torch.Tensor] = {}
 
@@ -292,14 +362,38 @@ class LibxsmmProvider(CpuGemmProvider):
 
     @classmethod
     def is_available(cls, features: CpuBackendFeatures) -> bool:
-        # Placeholder until the native LIBXSMM dispatch bridge is added.
-        return False
+        native = load_native_extension()
+        return (
+            native is not None
+            and features.machine in {"x86_64", "amd64", "x64"}
+            and features.has_avx2
+            and hasattr(native, "has_libxsmm")
+            and bool(native.has_libxsmm())
+        )
+
+    def execute(
+        self,
+        program: GemmEpilogueProgram,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        **tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        native = load_native_extension()
+        if native is None or not hasattr(native, "has_libxsmm") or not bool(native.has_libxsmm()):
+            return super().execute(program, A, B, **tensors)
+        return native.execute_libxsmm_postops(
+            program.name,
+            program.to_native(),
+            A,
+            B,
+            tensors,
+        )
 
 
 _PROVIDER_CLASSES: tuple[type[CpuGemmProvider], ...] = (
+    AtenFallbackProvider,
     OneDnnX64BrgemmProvider,
     LibxsmmProvider,
-    AtenFallbackProvider,
 )
 
 

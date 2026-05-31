@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 from kernels.cpu import gpt as cpu_gpt
 from kernels.cpu.ir import gelu_tanh, row_bias, scalar_scale, store_accumulator
 from kernels.cpu.native import load_native_extension
-from kernels.cpu.providers import OneDnnX64BrgemmProvider, select_provider
+from kernels.cpu.providers import LibxsmmProvider, OneDnnX64BrgemmProvider, select_provider
 from kernels.refs import gpt2 as ref_gpt
 from models import ops
 
@@ -172,12 +172,23 @@ def test_onednn_provider_requires_native_onednn_build(monkeypatch) -> None:
         select_provider()
 
 
+def test_libxsmm_provider_requires_native_libxsmm_build(monkeypatch) -> None:
+    native = load_native_extension()
+    if native is not None and hasattr(native, "has_libxsmm") and native.has_libxsmm():
+        pytest.skip("LIBXSMM native provider is available in this environment")
+
+    monkeypatch.setenv("CODA_CPU_PROVIDER", LibxsmmProvider.name)
+    with pytest.raises(RuntimeError):
+        select_provider()
+
+
 def test_optional_native_post_op_chain_smoke() -> None:
     if os.environ.get("CODA_CPU_JIT_BUILD") != "1":
         pytest.skip("native extension JIT build not requested")
 
     native = load_native_extension()
-    assert native is not None
+    if native is None:
+        pytest.skip("native extension is not available")
 
     A = torch.randn((4, 8), dtype=torch.float32)
     B = torch.randn((8, 16), dtype=torch.float32)
@@ -199,3 +210,28 @@ def test_optional_native_post_op_chain_smoke() -> None:
     O_ref = torch.nn.functional.silu(D2_ref[..., 0]) * D2_ref[..., 1]
     torch.testing.assert_close(D, D_ref)
     torch.testing.assert_close(outputs["O"], O_ref)
+
+
+def test_optional_native_libxsmm_post_op_chain_smoke(monkeypatch) -> None:
+    if os.environ.get("CODA_CPU_JIT_BUILD") != "1":
+        pytest.skip("native extension JIT build not requested")
+    if os.environ.get("CODA_CPU_WITH_LIBXSMM") != "1":
+        pytest.skip("LIBXSMM JIT build not requested")
+
+    native = load_native_extension()
+    if native is None or not hasattr(native, "has_libxsmm") or not native.has_libxsmm():
+        pytest.skip("LIBXSMM headers/libs are not available")
+
+    monkeypatch.setenv("CODA_CPU_PROVIDER", LibxsmmProvider.name)
+    provider = select_provider()
+    assert provider.name == LibxsmmProvider.name
+
+    A = torch.randn((4, 8), dtype=torch.float32)
+    B = torch.randn((8, 16), dtype=torch.float32)
+    R = torch.rsqrt((A ** 2).mean(dim=-1) + 1e-6)
+    D, O = cpu_gpt.gemm_rmsnorm_swiglu(A, B, R)
+    D_ref = A.float().mm(B.float()) * R.float().reshape(-1, 1)
+    D2_ref = D_ref.reshape(4, 8, 2)
+    O_ref = torch.nn.functional.silu(D2_ref[..., 0]) * D2_ref[..., 1]
+    torch.testing.assert_close(D, D_ref)
+    torch.testing.assert_close(O, O_ref)

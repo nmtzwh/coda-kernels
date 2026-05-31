@@ -1,0 +1,8 @@
+[submodule "third_party/onednn"]
+	path = third_party/onednn
+	url = https://github.com/uxlfoundation/oneDNN.git
+	shallow = true
+[submodule "third_party/libxsmm"]
+	path = third_party/libxsmm
+	url = https://github.com/libxsmm/libxsmm.git
+	shallow = true

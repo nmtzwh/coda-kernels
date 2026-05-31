@@ -51,8 +51,16 @@ std::pair<at::Tensor, pybind11::dict> run_post_ops(
         at::ScalarType output_dtype);
 
 bool has_onednn();
+bool has_libxsmm();
 
 std::pair<at::Tensor, pybind11::dict> execute_brgemm_postops(
+        const std::string &program_name,
+        const pybind11::list &nodes,
+        const at::Tensor &A,
+        const at::Tensor &B,
+        const pybind11::dict &tensors);
+
+std::pair<at::Tensor, pybind11::dict> execute_libxsmm_postops(
         const std::string &program_name,
         const pybind11::list &nodes,
         const at::Tensor &A,

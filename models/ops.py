@@ -1774,6 +1774,25 @@ def layer(
     backend: str,
     use_compile: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if backend == "cpu" and not torch.is_grad_enabled():
+        with torch.inference_mode():
+            x1, z1, rstd1, x2, y2, z2, rstd2 = layer_forward_tunable(
+                x0=x0,
+                y0=y0,
+                w0=w0,
+                w1=w1,
+                w2=w2,
+                w3=w3,
+                wn0=wn0,
+                wn1=wn1,
+                cos_sin=cos_sin,
+                eps=eps,
+                transpose=transpose,
+                backend=backend,
+                use_compile=use_compile,
+            )
+        return x2, y2
+
     return Layer.apply(
         x0,
         y0,
