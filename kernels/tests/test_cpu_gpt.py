@@ -1,3 +1,4 @@
+import os
 import math
 
 import pytest
@@ -5,6 +6,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from kernels.cpu import gpt as cpu_gpt
+from kernels.cpu.ir import gelu_tanh, row_bias, scalar_scale, store_accumulator
+from kernels.cpu.native import load_native_extension
+from kernels.cpu.providers import OneDnnX64BrgemmProvider, select_provider
 from kernels.refs import gpt2 as ref_gpt
 from models import ops
 
@@ -81,9 +85,9 @@ def test_cpu_forward_kernels_match_torch_reference(dtype: torch.dtype) -> None:
 def test_ops_layer_cpu_forward_matches_torch_backend() -> None:
     dtype = torch.float32
     batch_size, seq_len = 2, 4
-    hidden_dim, mlp_dim = 16, 32
-    qkv_dim = 48
-    num_heads, head_dim = 2, 8
+    hidden_dim, mlp_dim = 128, 256
+    qkv_dim = 384
+    num_heads, head_dim = 4, 32
 
     x0 = _randn((batch_size, seq_len, hidden_dim), dtype)
     y0 = _randn((batch_size, seq_len, hidden_dim), dtype)
@@ -138,3 +142,60 @@ def test_ops_layer_cpu_forward_matches_torch_backend() -> None:
 
     for actual, expected in zip(cpu_out, torch_out):
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_transformer_post_ops_serialize_for_native_provider() -> None:
+    nodes = [
+        row_bias("bias"),
+        scalar_scale(0.5),
+        gelu_tanh(),
+        store_accumulator("D"),
+    ]
+    native_nodes = [node.to_native() for node in nodes]
+    assert [node["op"] for node in native_nodes] == [
+        "row_bias",
+        "scalar_scale",
+        "gelu_tanh",
+        "store_accumulator",
+    ]
+    assert native_nodes[1]["value"] == 0.5
+    assert native_nodes[3]["output"] == "D"
+
+
+def test_onednn_provider_requires_native_onednn_build(monkeypatch) -> None:
+    native = load_native_extension()
+    if native is not None and native.has_onednn():
+        pytest.skip("oneDNN native provider is available in this environment")
+
+    monkeypatch.setenv("CODA_CPU_PROVIDER", OneDnnX64BrgemmProvider.name)
+    with pytest.raises(RuntimeError):
+        select_provider()
+
+
+def test_optional_native_post_op_chain_smoke() -> None:
+    if os.environ.get("CODA_CPU_JIT_BUILD") != "1":
+        pytest.skip("native extension JIT build not requested")
+
+    native = load_native_extension()
+    assert native is not None
+
+    A = torch.randn((4, 8), dtype=torch.float32)
+    B = torch.randn((8, 16), dtype=torch.float32)
+    R = torch.rsqrt((A ** 2).mean(dim=-1) + 1e-6)
+    program = cpu_gpt.GemmEpilogueProgram(
+        name="native_smoke",
+        nodes=(cpu_gpt.row_scale("R"), cpu_gpt.swiglu("O")),
+        output_dtype=A.dtype,
+    )
+    D, outputs = native.execute_brgemm_postops(
+        program.name,
+        program.to_native(),
+        A,
+        B,
+        {"R": R},
+    )
+    D_ref = A.float().mm(B.float()) * R.float().reshape(-1, 1)
+    D2_ref = D_ref.reshape(4, 8, 2)
+    O_ref = torch.nn.functional.silu(D2_ref[..., 0]) * D2_ref[..., 1]
+    torch.testing.assert_close(D, D_ref)
+    torch.testing.assert_close(outputs["O"], O_ref)

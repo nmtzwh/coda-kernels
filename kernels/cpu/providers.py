@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from kernels.cpu.ir import EpilogueOp, GemmEpilogueProgram
+from kernels.cpu.native import load_native_extension
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -31,6 +32,12 @@ def _row_view(tensor: torch.Tensor) -> torch.Tensor:
 
 def _col_view(tensor: torch.Tensor) -> torch.Tensor:
     return _to_acc(tensor).reshape(1, -1)
+
+
+def _scalar_value(value: float | None) -> float:
+    if value is None:
+        raise ValueError("epilogue node is missing a scalar value")
+    return float(value)
 
 
 def _rope(x: torch.Tensor, cos_sin: torch.Tensor, backward: bool = False) -> torch.Tensor:
@@ -66,14 +73,35 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
 class CpuBackendFeatures:
     machine: str
     processor: str
+    flags: frozenset[str]
+    has_avx2: bool
+    has_avx512: bool
+    has_amx: bool
     has_libxsmm_python: bool
     has_onednn_python: bool
 
 
+def _cpu_flags() -> frozenset[str]:
+    if os.name == "posix":
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+                for line in cpuinfo:
+                    if line.startswith("flags"):
+                        return frozenset(line.split(":", maxsplit=1)[1].split())
+        except OSError:
+            pass
+    return frozenset()
+
+
 def detect_features() -> CpuBackendFeatures:
+    flags = _cpu_flags()
     return CpuBackendFeatures(
         machine=platform.machine().lower(),
         processor=platform.processor().lower(),
+        flags=flags,
+        has_avx2="avx2" in flags,
+        has_avx512=any(flag.startswith("avx512") for flag in flags),
+        has_amx=any(flag.startswith("amx") for flag in flags),
         has_libxsmm_python=importlib.util.find_spec("libxsmm") is not None,
         has_onednn_python=any(
             importlib.util.find_spec(name) is not None
@@ -113,8 +141,20 @@ class CpuGemmProvider:
                     raise ValueError(f"residual shape mismatch: {tuple(aux.shape)} vs {tuple(acc.shape)}")
                 acc = acc + aux
 
+            elif node.op == EpilogueOp.ROW_BIAS:
+                acc = acc + _row_view(tensors[_require_name(node.tensor)])
+
+            elif node.op == EpilogueOp.COL_BIAS:
+                acc = acc + _col_view(tensors[_require_name(node.tensor)])
+
+            elif node.op == EpilogueOp.SCALAR_SCALE:
+                acc = acc * _scalar_value(node.value)
+
             elif node.op == EpilogueOp.ROW_SCALE:
                 acc = acc * _row_view(tensors[_require_name(node.tensor)])
+
+            elif node.op == EpilogueOp.COL_SCALE:
+                acc = acc * _col_view(tensors[_require_name(node.tensor)])
 
             elif node.op == EpilogueOp.ROW_VECTOR_SCALE_SIDE_OUTPUT:
                 side_outputs[_require_name(node.output)] = acc * _col_view(tensors[_require_name(node.tensor)])
@@ -131,6 +171,34 @@ class CpuGemmProvider:
                     .reshape(acc.shape[0], _ceil_div(acc.shape[1], node.block_size), node.block_size)
                     .mean(dim=-1)
                 )
+
+            elif node.op == EpilogueOp.ROW_SUM:
+                side_outputs[_require_name(node.output)] = acc.sum(dim=-1)
+
+            elif node.op == EpilogueOp.ROW_SUM_SQUARES:
+                side_outputs[_require_name(node.output)] = acc.square().sum(dim=-1)
+
+            elif node.op == EpilogueOp.BLOCK_MAX:
+                if node.block_size is None:
+                    raise ValueError("block max requires block_size")
+                if acc.shape[1] % node.block_size != 0:
+                    raise ValueError(
+                        f"N={acc.shape[1]} must be divisible by block_size={node.block_size}"
+                    )
+                side_outputs[_require_name(node.output)] = (
+                    acc.reshape(acc.shape[0], _ceil_div(acc.shape[1], node.block_size), node.block_size)
+                    .max(dim=-1)
+                    .values
+                )
+
+            elif node.op == EpilogueOp.SILU:
+                acc = torch.nn.functional.silu(acc)
+
+            elif node.op == EpilogueOp.GELU_TANH:
+                acc = torch.nn.functional.gelu(acc, approximate="tanh")
+
+            elif node.op == EpilogueOp.RELU:
+                acc = torch.relu(acc)
 
             elif node.op == EpilogueOp.SWIGLU:
                 side_outputs[_require_name(node.output)] = _swiglu(acc)
@@ -163,6 +231,9 @@ class CpuGemmProvider:
                     dim=-1,
                 )
 
+            elif node.op == EpilogueOp.STORE_ACCUMULATOR:
+                side_outputs[_require_name(node.output)] = acc
+
             else:
                 raise NotImplementedError(f"unsupported CPU epilogue op: {node.op}")
 
@@ -189,8 +260,31 @@ class OneDnnX64BrgemmProvider(CpuGemmProvider):
 
     @classmethod
     def is_available(cls, features: CpuBackendFeatures) -> bool:
-        # Placeholder until the native oneDNN ukernel bridge is added.
-        return False
+        native = load_native_extension()
+        return (
+            native is not None
+            and features.machine in {"x86_64", "amd64", "x64"}
+            and features.has_avx2
+            and bool(native.has_onednn())
+        )
+
+    def execute(
+        self,
+        program: GemmEpilogueProgram,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        **tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        native = load_native_extension()
+        if native is None or not bool(native.has_onednn()):
+            return super().execute(program, A, B, **tensors)
+        return native.execute_brgemm_postops(
+            program.name,
+            program.to_native(),
+            A,
+            B,
+            tensors,
+        )
 
 
 class LibxsmmProvider(CpuGemmProvider):
