@@ -30,18 +30,20 @@ at::Tensor fallback_accumulate(const at::Tensor &A, const at::Tensor &B) {
     return at::mm(A.to(at::kFloat), B.to(at::kFloat));
 }
 
+int64_t env_i64(const char *name, int64_t fallback);
+
 int64_t choose_m_tile(int64_t remaining) {
-    return remaining >= 32 ? 32 : std::min<int64_t>(remaining, 16);
+    const int64_t requested = env_i64("CODA_LIBXSMM_M_TILE", 128);
+    return std::min<int64_t>(remaining, requested);
 }
 
 int64_t choose_n_tile(int64_t remaining) {
-    if (remaining >= 64) return 64;
-    if (remaining >= 32) return 32;
-    return std::min<int64_t>(remaining, 16);
+    const int64_t requested = env_i64("CODA_LIBXSMM_N_TILE", 32);
+    return std::min<int64_t>(remaining, requested);
 }
 
 int64_t choose_k_tile(int64_t remaining) {
-    return remaining >= 128 ? 128 : std::min<int64_t>(remaining, 64);
+    return remaining;
 }
 
 int64_t env_i64(const char *name, int64_t fallback) {
@@ -63,7 +65,7 @@ bool env_enabled(const char *name, bool fallback) {
 }
 
 int64_t brgemm_k_tile(int64_t K) {
-    const int64_t requested = env_i64("CODA_LIBXSMM_BR_K_TILE", 128);
+    const int64_t requested = env_i64("CODA_LIBXSMM_BR_K_TILE", 512);
     if (requested <= 0 || K % requested != 0) {
         return 0;
     }
@@ -71,7 +73,7 @@ int64_t brgemm_k_tile(int64_t K) {
 }
 
 bool use_dense_sgemm(int64_t M, int64_t K, int64_t N) {
-    if (!env_enabled("CODA_LIBXSMM_DENSE_SGEMM", true)) {
+    if (!env_enabled("CODA_LIBXSMM_DENSE_SGEMM", false)) {
         return false;
     }
     const int64_t min_flops = env_i64("CODA_LIBXSMM_DENSE_MIN_FLOPS", 32LL * 1024LL * 1024LL);
@@ -80,10 +82,6 @@ bool use_dense_sgemm(int64_t M, int64_t K, int64_t N) {
 
 bool use_dense_omp() {
     return env_enabled("CODA_LIBXSMM_DENSE_OMP", true);
-}
-
-bool use_dense_aten() {
-    return env_enabled("CODA_LIBXSMM_DENSE_ATEN", true);
 }
 
 std::vector<int64_t> build_tiles(int64_t extent, int64_t (*choose_tile)(int64_t)) {
@@ -293,10 +291,6 @@ libxsmm_gemmfunction dispatch_brgemm_kernel(const BrgemmKey &key) {
 at::Tensor libxsmm_dense_accumulate(
         const at::Tensor &A,
         const at::Tensor &B) {
-    if (use_dense_aten()) {
-        return at::mm(A, B);
-    }
-
     const int64_t M = A.size(0);
     const int64_t K = A.size(1);
     const int64_t N = B.size(1);
@@ -393,7 +387,7 @@ at::Tensor libxsmm_accumulate(
     float *c_base = C.data_ptr<float>();
     const int64_t br_k_tile = brgemm_k_tile(K);
     const bool use_brgemm =
-            env_enabled("CODA_LIBXSMM_USE_BRGEMM", false) &&
+            env_enabled("CODA_LIBXSMM_USE_BRGEMM", true) &&
             br_k_tile > 0 &&
             K >= br_k_tile * 2;
 

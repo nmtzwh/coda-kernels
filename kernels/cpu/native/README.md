@@ -48,12 +48,12 @@ LIBXSMM and reports `has_libxsmm() == False`. This keeps the CPU backend usable
 on systems where LIBXSMM is not installed.
 
 For large dense Transformer projections, LIBXSMM main no longer exposes the old
-parallel dense GEMM helper. The LIBXSMM provider therefore uses the ATen dense
-epilogue route by default for large GEMMs and keeps the updated LIBXSMM JIT ABI
-available for smaller/tiled cases. Set `CODA_LIBXSMM_DENSE_ATEN=0` to test
-LIBXSMM's dense SGEMM route, `CODA_LIBXSMM_DENSE_SGEMM=0` to force the tiled JIT
-SMM path, or `CODA_LIBXSMM_USE_BRGEMM=1` to test the experimental strided
-batch-reduce GEMM mainloop.
+parallel dense GEMM helper. The LIBXSMM provider stays on native LIBXSMM paths:
+the default is a tiled strided batch-reduce GEMM mainloop with
+`CODA_LIBXSMM_M_TILE=128`, `CODA_LIBXSMM_N_TILE=32`, and
+`CODA_LIBXSMM_BR_K_TILE=512` on AVX2. `CODA_LIBXSMM_DENSE_SGEMM=1` enables the
+native `libxsmm_sgemm` row-block path for comparison, and
+`CODA_LIBXSMM_USE_BRGEMM=0` forces the tiled JIT SMM path.
 
 For AVX2-only hosts, build oneDNN with AVX2 GEMM kernels enabled and do not add
 `-march=native` or AVX512/AMX-only compiler flags to this extension. oneDNN's

@@ -16,24 +16,6 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def _env_enabled(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    return value != "0"
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        parsed = int(value)
-    except ValueError:
-        return default
-    return parsed if parsed > 0 else default
-
-
 def _require_matrix(name: str, tensor: torch.Tensor) -> None:
     if tensor.ndim != 2:
         raise ValueError(f"{name} must be a 2D tensor, got shape={tuple(tensor.shape)}")
@@ -398,9 +380,6 @@ class LibxsmmProvider(CpuGemmProvider):
         B: torch.Tensor,
         **tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if self._use_aten_dense_path(A, B):
-            return super().execute(program, A, B, **tensors)
-
         native = load_native_extension()
         if native is None or not hasattr(native, "has_libxsmm") or not bool(native.has_libxsmm()):
             return super().execute(program, A, B, **tensors)
@@ -411,15 +390,6 @@ class LibxsmmProvider(CpuGemmProvider):
             B,
             tensors,
         )
-
-    @staticmethod
-    def _use_aten_dense_path(A: torch.Tensor, B: torch.Tensor) -> bool:
-        if not _env_enabled("CODA_LIBXSMM_DENSE_ATEN", True):
-            return False
-        if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[0]:
-            return False
-        min_flops = _env_int("CODA_LIBXSMM_DENSE_MIN_FLOPS", 32 * 1024 * 1024)
-        return 2 * int(A.shape[0]) * int(A.shape[1]) * int(B.shape[1]) >= min_flops
 
 
 _PROVIDER_CLASSES: tuple[type[CpuGemmProvider], ...] = (

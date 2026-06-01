@@ -120,6 +120,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--skip-compiled", action="store_true")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
@@ -164,6 +165,35 @@ def main() -> None:
     cold_ms = _time_once(torch_fn)
     median_ms = _bench(torch_fn, warmup=args.warmup, repeats=args.repeats)
     print(f"torch/native: cold={cold_ms:.3f} ms warm_median={median_ms:.3f} ms")
+
+    if not args.skip_compiled:
+        try:
+            compiled_layer = torch.compile(_torch_native_layer, fullgraph=True, dynamic=False)
+            torch_compiled_fn = lambda: compiled_layer(
+                x0=x0,
+                y0=y0,
+                w0=w0,
+                w1=w1,
+                w2=w2,
+                w3=w3,
+                wn0=wn0,
+                wn1=wn1,
+                cos_sin=cos_sin,
+                eps=1e-6,
+            )
+            compiled_out = torch_compiled_fn()
+            max_diff = max(
+                (actual.float() - expected.float()).abs().max().item()
+                for actual, expected in zip(compiled_out, torch_out)
+            )
+            cold_ms = _time_once(torch_compiled_fn)
+            median_ms = _bench(torch_compiled_fn, warmup=args.warmup, repeats=args.repeats)
+            print(
+                f"torch/compiled: cold={cold_ms:.3f} ms "
+                f"warm_median={median_ms:.3f} ms max_diff={max_diff:.6f}"
+            )
+        except Exception as exc:
+            print(f"torch/compiled: skipped ({type(exc).__name__}: {exc})")
 
     for provider in ("aten", "onednn-x64-brgemm", "libxsmm"):
         try:
