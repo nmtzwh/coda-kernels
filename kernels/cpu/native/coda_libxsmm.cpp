@@ -82,6 +82,10 @@ bool use_dense_omp() {
     return env_enabled("CODA_LIBXSMM_DENSE_OMP", true);
 }
 
+bool use_dense_aten() {
+    return env_enabled("CODA_LIBXSMM_DENSE_ATEN", true);
+}
+
 std::vector<int64_t> build_tiles(int64_t extent, int64_t (*choose_tile)(int64_t)) {
     std::vector<int64_t> starts;
     starts.reserve(static_cast<size_t>((extent + 15) / 16));
@@ -160,7 +164,7 @@ struct KernelKeyHash {
 
 std::once_flag libxsmm_init_once;
 std::mutex kernel_cache_mutex;
-std::unordered_map<KernelKey, libxsmm_smmfunction, KernelKeyHash> kernel_cache;
+std::unordered_map<KernelKey, libxsmm_gemmfunction, KernelKeyHash> kernel_cache;
 
 struct BrgemmKey {
     int m;
@@ -211,9 +215,9 @@ struct BrgemmKeyHash {
 };
 
 std::mutex brgemm_kernel_cache_mutex;
-std::unordered_map<BrgemmKey, libxsmm_smmfunction_reducebatch_strd, BrgemmKeyHash> brgemm_kernel_cache;
+std::unordered_map<BrgemmKey, libxsmm_gemmfunction, BrgemmKeyHash> brgemm_kernel_cache;
 
-libxsmm_smmfunction dispatch_smm_kernel(const KernelKey &key) {
+libxsmm_gemmfunction dispatch_smm_kernel(const KernelKey &key) {
     std::call_once(libxsmm_init_once, []() { libxsmm_init(); });
 
     std::lock_guard<std::mutex> guard(kernel_cache_mutex);
@@ -222,33 +226,31 @@ libxsmm_smmfunction dispatch_smm_kernel(const KernelKey &key) {
         return it->second;
     }
 
-    const float alpha = 1.0f;
-    const float beta = key.beta ? 1.0f : 0.0f;
     const libxsmm_blasint m = static_cast<libxsmm_blasint>(key.m);
     const libxsmm_blasint n = static_cast<libxsmm_blasint>(key.n);
     const libxsmm_blasint k = static_cast<libxsmm_blasint>(key.k);
     const libxsmm_blasint lda = static_cast<libxsmm_blasint>(key.lda);
     const libxsmm_blasint ldb = static_cast<libxsmm_blasint>(key.ldb);
     const libxsmm_blasint ldc = static_cast<libxsmm_blasint>(key.ldc);
-    const int flags = LIBXSMM_GEMM_FLAG_NONE;
-    const int prefetch = LIBXSMM_PREFETCH_NONE;
-
-    auto fn = libxsmm_smmdispatch(
+    const auto shape = libxsmm_create_gemm_shape(
             m,
             n,
             k,
-            &lda,
-            &ldb,
-            &ldc,
-            &alpha,
-            &beta,
-            &flags,
-            &prefetch);
+            lda,
+            ldb,
+            ldc,
+            LIBXSMM_DATATYPE_F32,
+            LIBXSMM_DATATYPE_F32,
+            LIBXSMM_DATATYPE_F32,
+            LIBXSMM_DATATYPE_F32);
+    const auto flags = static_cast<libxsmm_bitfield>(
+            key.beta ? LIBXSMM_GEMM_FLAG_NONE : LIBXSMM_GEMM_FLAG_BETA_0);
+    auto fn = libxsmm_dispatch_gemm(shape, flags, LIBXSMM_GEMM_PREFETCH_NONE);
     kernel_cache.emplace(key, fn);
     return fn;
 }
 
-libxsmm_smmfunction_reducebatch_strd dispatch_brgemm_kernel(const BrgemmKey &key) {
+libxsmm_gemmfunction dispatch_brgemm_kernel(const BrgemmKey &key) {
     std::call_once(libxsmm_init_once, []() { libxsmm_init(); });
 
     std::lock_guard<std::mutex> guard(brgemm_kernel_cache_mutex);
@@ -257,8 +259,6 @@ libxsmm_smmfunction_reducebatch_strd dispatch_brgemm_kernel(const BrgemmKey &key
         return it->second;
     }
 
-    const float alpha = 1.0f;
-    const float beta = key.beta ? 1.0f : 0.0f;
     const libxsmm_blasint m = static_cast<libxsmm_blasint>(key.m);
     const libxsmm_blasint n = static_cast<libxsmm_blasint>(key.n);
     const libxsmm_blasint k = static_cast<libxsmm_blasint>(key.k);
@@ -267,24 +267,25 @@ libxsmm_smmfunction_reducebatch_strd dispatch_brgemm_kernel(const BrgemmKey &key
     const libxsmm_blasint ldc = static_cast<libxsmm_blasint>(key.ldc);
     const libxsmm_blasint stride_a = static_cast<libxsmm_blasint>(key.stride_a);
     const libxsmm_blasint stride_b = static_cast<libxsmm_blasint>(key.stride_b);
-    const libxsmm_blasint br_count = static_cast<libxsmm_blasint>(key.br_count);
-    const int flags = LIBXSMM_GEMM_FLAG_NONE;
-    const int prefetch = LIBXSMM_PREFETCH_NONE;
-
-    auto fn = libxsmm_smmdispatch_reducebatch_strd_unroll(
+    const auto shape = libxsmm_create_gemm_shape(
             m,
             n,
             k,
+            lda,
+            ldb,
+            ldc,
+            LIBXSMM_DATATYPE_F32,
+            LIBXSMM_DATATYPE_F32,
+            LIBXSMM_DATATYPE_F32,
+            LIBXSMM_DATATYPE_F32);
+    const auto flags = static_cast<libxsmm_bitfield>(
+            key.beta ? LIBXSMM_GEMM_FLAG_NONE : LIBXSMM_GEMM_FLAG_BETA_0);
+    const auto br_config = libxsmm_create_gemm_batch_reduce_config(
+            LIBXSMM_GEMM_BATCH_REDUCE_STRIDE,
             stride_a,
             stride_b,
-            br_count,
-            &lda,
-            &ldb,
-            &ldc,
-            &alpha,
-            &beta,
-            &flags,
-            &prefetch);
+            static_cast<unsigned char>(std::min(key.br_count, 255)));
+    auto fn = libxsmm_dispatch_brgemm(shape, flags, LIBXSMM_GEMM_PREFETCH_NONE, br_config);
     brgemm_kernel_cache.emplace(key, fn);
     return fn;
 }
@@ -292,6 +293,10 @@ libxsmm_smmfunction_reducebatch_strd dispatch_brgemm_kernel(const BrgemmKey &key
 at::Tensor libxsmm_dense_accumulate(
         const at::Tensor &A,
         const at::Tensor &B) {
+    if (use_dense_aten()) {
+        return at::mm(A, B);
+    }
+
     const int64_t M = A.size(0);
     const int64_t K = A.size(1);
     const int64_t N = B.size(1);
@@ -308,39 +313,28 @@ at::Tensor libxsmm_dense_accumulate(
     const libxsmm_blasint ldc = static_cast<libxsmm_blasint>(N);
 
     if (use_dense_omp()) {
-#if defined(CODA_CPU_WITH_LIBXSMMEXT)
-        libxsmm_xgemm_omp(
-                LIBXSMM_GEMM_PRECISION_F32,
-                LIBXSMM_GEMM_PRECISION_F32,
-                &trans,
-                &trans,
-                &cm,
-                &cn,
-                &ck,
-                &alpha,
-                B.data_ptr<float>(),
-                &lda,
-                A.data_ptr<float>(),
-                &ldb,
-                &beta,
-                C.data_ptr<float>(),
-                &ldc);
-#else
-        libxsmm_sgemm(
-                &trans,
-                &trans,
-                &cm,
-                &cn,
-                &ck,
-                &alpha,
-                B.data_ptr<float>(),
-                &lda,
-                A.data_ptr<float>(),
-                &ldb,
-                &beta,
-                C.data_ptr<float>(),
-                &ldc);
-#endif
+        const float *b_base = B.data_ptr<float>();
+        const float *a_base = A.data_ptr<float>();
+        float *c_base = C.data_ptr<float>();
+        at::parallel_for(0, M, 16, [&](int64_t begin, int64_t end) {
+            const libxsmm_blasint block_rows = static_cast<libxsmm_blasint>(end - begin);
+            const float *a_block = a_base + begin * K;
+            float *c_block = c_base + begin * N;
+            libxsmm_sgemm(
+                    &trans,
+                    &trans,
+                    &cm,
+                    &block_rows,
+                    &ck,
+                    &alpha,
+                    b_base,
+                    &lda,
+                    a_block,
+                    &ldb,
+                    &beta,
+                    c_block,
+                    &ldc);
+        });
     } else {
         libxsmm_sgemm(
                 &trans,
@@ -436,7 +430,12 @@ at::Tensor libxsmm_accumulate(
                 const float *a_tile = a_base + m0 * K;
                 float *c_tile = c_base + m0 * N + n0;
                 const unsigned long long count = static_cast<unsigned long long>(br_count);
-                fn(b_tile, a_tile, c_tile, &count);
+                libxsmm_gemm_param args{};
+                args.op.tertiary = const_cast<unsigned long long *>(&count);
+                args.a.primary = const_cast<float *>(b_tile);
+                args.b.primary = const_cast<float *>(a_tile);
+                args.c.primary = c_tile;
+                fn(&args);
                 continue;
             }
 
@@ -463,7 +462,11 @@ at::Tensor libxsmm_accumulate(
                 const float *b_tile = b_base + k0 * N + n0;
                 const float *a_tile = a_base + m0 * K + k0;
                 float *c_tile = c_base + m0 * N + n0;
-                fn(b_tile, a_tile, c_tile);
+                libxsmm_gemm_param args{};
+                args.a.primary = const_cast<float *>(b_tile);
+                args.b.primary = const_cast<float *>(a_tile);
+                args.c.primary = c_tile;
+                fn(&args);
                 k0 += kt;
             }
         }

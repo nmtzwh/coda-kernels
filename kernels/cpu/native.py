@@ -62,12 +62,6 @@ def load_native_extension():
                 extra_ldflags.append(f"-Wl,-rpath,{library_dir}")
         extra_cflags.append("/DCODA_CPU_WITH_LIBXSMM=1" if os.name == "nt" else "-DCODA_CPU_WITH_LIBXSMM=1")
         libxsmm_libs = libs or _default_libxsmm_libs(library_dir)
-        if _libxsmmext_enabled(library_dir, libxsmm_libs):
-            extra_cflags.append(
-                "/DCODA_CPU_WITH_LIBXSMMEXT=1"
-                if os.name == "nt"
-                else "-DCODA_CPU_WITH_LIBXSMMEXT=1"
-            )
         extra_ldflags.extend(_normalize_libs(libxsmm_libs))
 
     return load(
@@ -188,28 +182,7 @@ def _libxsmm_paths() -> tuple[Path | None, Path | None]:
 
 
 def _default_libxsmm_libs(library_dir: Path | None) -> list[str]:
-    if library_dir is not None:
-        ext_candidates = (
-            ("libxsmmext.lib", "xsmmext.lib")
-            if os.name == "nt"
-            else ("libxsmmext.so", "libxsmmext.a", "libxsmmext.dylib")
-        )
-        if any((library_dir / candidate).exists() for candidate in ext_candidates):
-            return ["xsmmext", "xsmm"]
     return ["xsmm"]
-
-
-def _libxsmmext_enabled(library_dir: Path | None, libs: list[str]) -> bool:
-    if any("xsmmext" in lib for lib in libs):
-        return True
-    if library_dir is None:
-        return False
-    ext_candidates = (
-        ("libxsmmext.lib", "xsmmext.lib")
-        if os.name == "nt"
-        else ("libxsmmext.so", "libxsmmext.a", "libxsmmext.dylib")
-    )
-    return any((library_dir / candidate).exists() for candidate in ext_candidates)
 
 
 def _can_enable_libxsmm() -> bool:

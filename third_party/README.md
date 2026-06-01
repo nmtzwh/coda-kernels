@@ -5,7 +5,7 @@ CODA's CPU backend can use these optional native GEMM providers:
 | Dependency | Path | Pinned release | Purpose |
 | --- | --- | --- | --- |
 | oneDNN | `third_party/onednn` | `v3.12` | x86 BRGeMM provider |
-| LIBXSMM | `third_party/libxsmm` | `1.17` | portable JIT SMM/BRGEMM provider |
+| LIBXSMM | `third_party/libxsmm` | `main` | portable JIT SMM/BRGEMM provider |
 
 The dependencies are recorded as shallow Git submodules. After cloning CODA,
 initialize them with:

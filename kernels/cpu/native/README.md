@@ -38,7 +38,7 @@ export CODA_CPU_JIT_BUILD=1
 export CODA_CPU_WITH_LIBXSMM=1
 export LIBXSMM_INCLUDE_DIR=/path/to/libxsmm/include
 export LIBXSMM_LIBRARY_DIR=/path/to/libxsmm/lib
-export LIBXSMM_LIBS="xsmmext xsmm"  # optional; can also contain raw linker flags
+export LIBXSMM_LIBS="xsmm"  # optional; can also contain raw linker flags
 python -c "from kernels.cpu.native import load_native_extension; n = load_native_extension(); print(n, n.has_libxsmm() if n else False)"
 ```
 
@@ -47,11 +47,13 @@ library cannot be found, the JIT build compiles the native extension without
 LIBXSMM and reports `has_libxsmm() == False`. This keeps the CPU backend usable
 on systems where LIBXSMM is not installed.
 
-For large dense Transformer projections, the LIBXSMM provider uses
-`libxsmm_xgemm_omp` when `libxsmmext` is available. Set
-`CODA_LIBXSMM_DENSE_SGEMM=0` to force the tiled SMM path, or
-`CODA_LIBXSMM_USE_BRGEMM=1` to test the experimental strided batch-reduce SMM
-mainloop.
+For large dense Transformer projections, LIBXSMM main no longer exposes the old
+parallel dense GEMM helper. The LIBXSMM provider therefore uses the ATen dense
+epilogue route by default for large GEMMs and keeps the updated LIBXSMM JIT ABI
+available for smaller/tiled cases. Set `CODA_LIBXSMM_DENSE_ATEN=0` to test
+LIBXSMM's dense SGEMM route, `CODA_LIBXSMM_DENSE_SGEMM=0` to force the tiled JIT
+SMM path, or `CODA_LIBXSMM_USE_BRGEMM=1` to test the experimental strided
+batch-reduce GEMM mainloop.
 
 For AVX2-only hosts, build oneDNN with AVX2 GEMM kernels enabled and do not add
 `-march=native` or AVX512/AMX-only compiler flags to this extension. oneDNN's

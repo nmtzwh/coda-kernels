@@ -4,6 +4,7 @@ import importlib.util
 import os
 import platform
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
@@ -13,6 +14,24 @@ from kernels.cpu.native import load_native_extension
 
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
+
+
+def _env_enabled(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value != "0"
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _require_matrix(name: str, tensor: torch.Tensor) -> None:
@@ -104,6 +123,7 @@ def _cpu_flags() -> frozenset[str]:
     return frozenset()
 
 
+@lru_cache(maxsize=1)
 def detect_features() -> CpuBackendFeatures:
     flags = _cpu_flags()
     return CpuBackendFeatures(
@@ -378,6 +398,9 @@ class LibxsmmProvider(CpuGemmProvider):
         B: torch.Tensor,
         **tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self._use_aten_dense_path(A, B):
+            return super().execute(program, A, B, **tensors)
+
         native = load_native_extension()
         if native is None or not hasattr(native, "has_libxsmm") or not bool(native.has_libxsmm()):
             return super().execute(program, A, B, **tensors)
@@ -389,6 +412,15 @@ class LibxsmmProvider(CpuGemmProvider):
             tensors,
         )
 
+    @staticmethod
+    def _use_aten_dense_path(A: torch.Tensor, B: torch.Tensor) -> bool:
+        if not _env_enabled("CODA_LIBXSMM_DENSE_ATEN", True):
+            return False
+        if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[0]:
+            return False
+        min_flops = _env_int("CODA_LIBXSMM_DENSE_MIN_FLOPS", 32 * 1024 * 1024)
+        return 2 * int(A.shape[0]) * int(A.shape[1]) * int(B.shape[1]) >= min_flops
+
 
 _PROVIDER_CLASSES: tuple[type[CpuGemmProvider], ...] = (
     AtenFallbackProvider,
@@ -397,12 +429,11 @@ _PROVIDER_CLASSES: tuple[type[CpuGemmProvider], ...] = (
 )
 
 
-def select_provider(preferred: str | None = None) -> CpuGemmProvider:
+@lru_cache(maxsize=None)
+def _select_provider_cached(requested: str | None) -> CpuGemmProvider:
     features = detect_features()
-    requested = preferred or os.environ.get("CODA_CPU_PROVIDER")
 
     if requested:
-        requested = requested.lower()
         for provider_cls in _PROVIDER_CLASSES:
             if requested in {provider_cls.name, provider_cls.name.split("-")[0]}:
                 if not provider_cls.is_available(features):
@@ -418,6 +449,11 @@ def select_provider(preferred: str | None = None) -> CpuGemmProvider:
             return provider_cls()
 
     return AtenFallbackProvider()
+
+
+def select_provider(preferred: str | None = None) -> CpuGemmProvider:
+    requested = preferred or os.environ.get("CODA_CPU_PROVIDER")
+    return _select_provider_cached(requested.lower() if requested else None)
 
 
 def current_provider_name() -> str:
