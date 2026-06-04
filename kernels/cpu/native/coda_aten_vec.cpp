@@ -855,10 +855,18 @@ bool has_aten_vec() {
 }
 
 std::string aten_vec_isa() {
-#if defined(CODA_CPU_ATEN_VEC_ISA_AVX2)
+#if defined(CODA_CPU_ATEN_VEC_ISA_AVX512)
+    return "avx512";
+#elif defined(CODA_CPU_ATEN_VEC_ISA_AVX2)
     return "avx2";
+#elif defined(CODA_CPU_ATEN_VEC_ISA_SVE256)
+    return "sve256";
 #elif defined(CODA_CPU_ATEN_VEC_ISA_GENERIC)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "neon";
+#else
     return "generic";
+#endif
 #else
     return "unavailable";
 #endif

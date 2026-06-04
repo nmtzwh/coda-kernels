@@ -12,6 +12,10 @@ from kernels.cpu.ir import EpilogueOp, GemmEpilogueProgram
 from kernels.cpu.native import load_native_extension
 
 
+_X86_64_MACHINES = frozenset({"x86_64", "amd64", "x64"})
+_AARCH64_MACHINES = frozenset({"aarch64", "arm64"})
+
+
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
@@ -90,17 +94,25 @@ class CpuBackendFeatures:
     has_avx2: bool
     has_avx512: bool
     has_amx: bool
+    has_neon: bool
+    has_sve: bool
     has_libxsmm_python: bool
     has_onednn_python: bool
+
+
+def _parse_cpu_flags(cpuinfo: str) -> frozenset[str]:
+    for line in cpuinfo.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() in {"flags", "features"}:
+            return frozenset(value.lower().split())
+    return frozenset()
 
 
 def _cpu_flags() -> frozenset[str]:
     if os.name == "posix":
         try:
             with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
-                for line in cpuinfo:
-                    if line.startswith("flags"):
-                        return frozenset(line.split(":", maxsplit=1)[1].split())
+                return _parse_cpu_flags(cpuinfo.read())
         except OSError:
             pass
     return frozenset()
@@ -120,14 +132,19 @@ def _torch_cpu_capability() -> str:
 def detect_features() -> CpuBackendFeatures:
     flags = _cpu_flags()
     torch_capability = _torch_cpu_capability()
+    machine = platform.machine().lower()
     return CpuBackendFeatures(
-        machine=platform.machine().lower(),
+        machine=machine,
         processor=platform.processor().lower(),
         torch_cpu_capability=torch_capability,
         flags=flags,
         has_avx2="avx2" in flags or "avx2" in torch_capability or "avx512" in torch_capability,
         has_avx512=any(flag.startswith("avx512") for flag in flags) or "avx512" in torch_capability,
         has_amx=any(flag.startswith("amx") for flag in flags),
+        has_neon=machine in _AARCH64_MACHINES and (
+            "asimd" in flags or "neon" in flags or platform.system() == "Darwin"
+        ),
+        has_sve="sve" in flags or "sve" in torch_capability,
         has_libxsmm_python=importlib.util.find_spec("libxsmm") is not None,
         has_onednn_python=any(
             importlib.util.find_spec(name) is not None
@@ -483,10 +500,14 @@ class OneDnnX64BrgemmProvider(CpuGemmProvider):
     @classmethod
     def is_available(cls, features: CpuBackendFeatures) -> bool:
         native = load_native_extension()
+        architecture_supported = (
+            features.machine in _X86_64_MACHINES and features.has_avx2
+        ) or (
+            features.machine in _AARCH64_MACHINES and features.has_sve
+        )
         return (
             native is not None
-            and features.machine in {"x86_64", "amd64", "x64"}
-            and features.has_avx2
+            and architecture_supported
             and bool(native.has_onednn())
         )
 
@@ -515,10 +536,15 @@ class LibxsmmProvider(CpuGemmProvider):
     @classmethod
     def is_available(cls, features: CpuBackendFeatures) -> bool:
         native = load_native_extension()
+        architecture_supported = (
+            features.machine in _X86_64_MACHINES and features.has_avx2
+        ) or (
+            features.machine in _AARCH64_MACHINES
+            and (features.has_neon or features.has_sve)
+        )
         return (
             native is not None
-            and features.machine in {"x86_64", "amd64", "x64"}
-            and features.has_avx2
+            and architecture_supported
             and hasattr(native, "has_libxsmm")
             and bool(native.has_libxsmm())
         )

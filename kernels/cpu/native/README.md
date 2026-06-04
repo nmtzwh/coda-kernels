@@ -33,11 +33,15 @@ The ATen vector path uses `ATen/cpu/vec/vec.h`, compiles against the PyTorch
 2.12 CPU headers, and supports forward contiguous float32 transformer GEMM
 epilogues first. Unsupported dtype/layout cases fall back to the Python ATen
 provider unless `CODA_ATEN_VEC_STRICT=1` is set. Set
-`CODA_CPU_ATEN_VEC_ISA=generic` to avoid AVX2 flags, or
-`CODA_CPU_ATEN_VEC_ISA=avx2` to require AVX2/FMA flags.
+`CODA_CPU_ATEN_VEC_ISA=generic` to use the platform baseline,
+`CODA_CPU_ATEN_VEC_ISA=avx2` or `avx512` on x86, or
+`CODA_CPU_ATEN_VEC_ISA=sve256` on AArch64. Auto-selection prefers AVX512 over
+AVX2 and selects SVE256 only when PyTorch reports `SVE256`; otherwise AArch64
+uses the generic 128-bit NEON implementation. PyTorch 2.12 exposes a fixed
+SVE256 ATen-vector specialization, so other SVE vector lengths use NEON here.
 The GEMM loop packs RHS register panels, keeps `Kc x Nr` in 80% of L1D, keeps
-the active LHS `Mc x K` panel in 75% of L2, and uses named `4 x 24` ATen-vector
-register tiles before applying vectorized transformer epilogues. Cache sizes
+the active LHS `Mc x K` panel in 75% of L2, and uses named `4 x (3 * vector
+length)` ATen-vector register tiles before applying vectorized transformer epilogues. Cache sizes
 and the ATen parallel backend are detected from the installed PyTorch 2.12 CPU
 wheel. OpenMP wheels compile and link the extension with OpenMP; native-thread-
 pool wheels use ATen's native parallel backend.
@@ -51,6 +55,9 @@ The high-performance oneDNN route is available only
 when linked with oneDNN ukernels. The JIT extension defines
 `DNNL_EXPERIMENTAL_UKERNEL=1` when `CODA_CPU_WITH_ONEDNN=1` is enabled because
 the BRGeMM ukernel C++ API is guarded as experimental in oneDNN headers.
+The pinned oneDNN 3.12 BRGeMM ukernel supports x86 AVX2/AVX512 and AArch64 SVE
+128/256/512, but not NEON-only AArch64. The provider keeps its legacy
+`onednn-x64-brgemm` name and enables AArch64 only when SVE is detected.
 
 Enable the optional LIBXSMM bridge with:
 
@@ -67,6 +74,9 @@ If `CODA_CPU_WITH_LIBXSMM=1` is set but `libxsmm.h` or a linkable LIBXSMM
 library cannot be found, the JIT build compiles the native extension without
 LIBXSMM and reports `has_libxsmm() == False`. This keeps the CPU backend usable
 on systems where LIBXSMM is not installed.
+The pinned LIBXSMM build contains x86 AVX2/AVX512 and AArch64 NEON/SVE
+GEMM/BRGeMM generators; provider availability accepts both x86 AVX2-or-newer
+and AArch64 builds.
 
 For large dense Transformer projections, LIBXSMM main no longer exposes the old
 parallel dense GEMM helper. The LIBXSMM provider stays on native LIBXSMM paths:
@@ -92,6 +102,6 @@ python -c "import torch; print(torch.__version__); assert torch.__version__.star
 pytest kernels/tests/test_cpu_gpt.py -q
 CODA_CPU_JIT_BUILD=1 pytest kernels/tests/test_cpu_gpt.py -q
 CODA_CPU_JIT_BUILD=1 CODA_CPU_WITH_ATEN_VEC=1 CODA_CPU_PROVIDER=aten-vec pytest kernels/tests/test_cpu_gpt.py -q
-CODA_CPU_JIT_BUILD=1 CODA_CPU_WITH_ATEN_VEC=1 python kernels/benchmarks/cpu_transformer.py --threads 8
+CODA_CPU_JIT_BUILD=1 CODA_CPU_WITH_ATEN_VEC=1 python -m kernels.benchmarks.cpu_transformer --threads 8
 CODA_CPU_JIT_BUILD=1 CODA_CPU_WITH_LIBXSMM=1 pytest kernels/tests/test_cpu_gpt.py -q
 ```

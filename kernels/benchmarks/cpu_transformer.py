@@ -73,6 +73,27 @@ def _time_once(fn) -> float:
     return (time.perf_counter() - start) * 1000.0
 
 
+def _transformer_gemm_flops(args: argparse.Namespace) -> int:
+    m = args.batch_size * args.seq_len
+    hidden_dim = args.hidden_dim
+    intermediate_dim = args.intermediate_dim
+    qkv_dim = args.qkv_dim or hidden_dim * 3
+    return 2 * m * (
+        hidden_dim * hidden_dim
+        + hidden_dim * (intermediate_dim * 2)
+        + intermediate_dim * hidden_dim
+        + hidden_dim * qkv_dim
+    )
+
+
+def _gemm_gflops(flops: int, elapsed_ms: float) -> float:
+    return flops / (elapsed_ms * 1_000_000.0)
+
+
+def _warm_result(flops: int, median_ms: float) -> str:
+    return f"warm_median={median_ms:.3f} ms gemm_gflops={_gemm_gflops(flops, median_ms):.2f}"
+
+
 @contextmanager
 def _provider_env(provider: str):
     previous = os.environ.get("CODA_CPU_PROVIDER")
@@ -127,6 +148,8 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     inputs = _make_inputs(args)
     x0, y0, w0, w1, w2, w3, wn0, wn1, cos_sin, cos, sin = inputs
+    gemm_flops = _transformer_gemm_flops(args)
+    print(f"workload: gemm_flops={gemm_flops / 1e9:.6f} GFLOP")
 
     def cpu_layer_fn(backend: str):
         return lambda: ops.layer(
@@ -164,7 +187,7 @@ def main() -> None:
     torch_out = torch_fn()
     cold_ms = _time_once(torch_fn)
     median_ms = _bench(torch_fn, warmup=args.warmup, repeats=args.repeats)
-    print(f"torch/native: cold={cold_ms:.3f} ms warm_median={median_ms:.3f} ms")
+    print(f"torch/native: cold={cold_ms:.3f} ms {_warm_result(gemm_flops, median_ms)}")
 
     if not args.skip_compiled:
         try:
@@ -190,7 +213,7 @@ def main() -> None:
             median_ms = _bench(torch_compiled_fn, warmup=args.warmup, repeats=args.repeats)
             print(
                 f"torch/compiled: cold={cold_ms:.3f} ms "
-                f"warm_median={median_ms:.3f} ms max_diff={max_diff:.6f}"
+                f"{_warm_result(gemm_flops, median_ms)} max_diff={max_diff:.6f}"
             )
         except Exception as exc:
             print(f"torch/compiled: skipped ({type(exc).__name__}: {exc})")
@@ -213,7 +236,7 @@ def main() -> None:
             median_ms = _bench(cpu_fn, warmup=args.warmup, repeats=args.repeats)
             print(
                 f"cpu/{provider}: cold={cold_ms:.3f} ms "
-                f"warm_median={median_ms:.3f} ms max_diff={max_diff:.6f}"
+                f"{_warm_result(gemm_flops, median_ms)} max_diff={max_diff:.6f}"
             )
 
 

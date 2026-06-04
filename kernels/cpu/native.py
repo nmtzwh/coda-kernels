@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import shlex
 import os
+import platform
 import subprocess
 import tempfile
 from ctypes.util import find_library
@@ -208,16 +209,63 @@ def _supports_avx2() -> bool:
     return False
 
 
+def _supports_avx512() -> bool:
+    capability = _torch_cpu_capability()
+    if "AVX512" in capability:
+        return True
+    if os.name == "posix":
+        try:
+            flags = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
+            return "avx512" in flags
+        except OSError:
+            return False
+    return False
+
+
+def _supports_sve256() -> bool:
+    return "SVE256" in _torch_cpu_capability()
+
+
+def _select_aten_vec_isa(requested_isa: str) -> str:
+    if requested_isa not in {"auto", "generic", "avx2", "avx512", "sve256"}:
+        raise ValueError(f"unknown CODA_CPU_ATEN_VEC_ISA={requested_isa!r}")
+    if requested_isa != "auto":
+        return requested_isa
+    if _supports_avx512():
+        return "avx512"
+    if _supports_avx2():
+        return "avx2"
+    if _supports_sve256():
+        return "sve256"
+    return "generic"
+
+
 def _aten_vec_cflags() -> list[str]:
     requested_isa = os.environ.get("CODA_CPU_ATEN_VEC_ISA", "auto").lower()
-    use_avx2 = requested_isa == "avx2" or (requested_isa == "auto" and _supports_avx2())
+    selected_isa = _select_aten_vec_isa(requested_isa)
 
-    if requested_isa == "generic":
-        use_avx2 = False
-    elif requested_isa not in {"auto", "avx2"}:
-        raise ValueError(f"unknown CODA_CPU_ATEN_VEC_ISA={requested_isa!r}")
+    if selected_isa == "avx512":
+        if os.name == "nt":
+            return [
+                "/DCODA_CPU_WITH_ATEN_VEC=1",
+                "/DCPU_CAPABILITY=AVX512",
+                "/DCPU_CAPABILITY_AVX512=1",
+                "/DCODA_CPU_ATEN_VEC_ISA_AVX512=1",
+                "/arch:AVX512",
+            ]
+        return [
+            "-DCODA_CPU_WITH_ATEN_VEC=1",
+            "-DCPU_CAPABILITY=AVX512",
+            "-DCPU_CAPABILITY_AVX512=1",
+            "-DCODA_CPU_ATEN_VEC_ISA_AVX512=1",
+            "-mavx512f",
+            "-mavx512dq",
+            "-mavx512vl",
+            "-mavx512bw",
+            "-mfma",
+        ]
 
-    if use_avx2:
+    if selected_isa == "avx2":
         if os.name == "nt":
             return [
                 "/DCODA_CPU_WITH_ATEN_VEC=1",
@@ -233,6 +281,20 @@ def _aten_vec_cflags() -> list[str]:
             "-DCODA_CPU_ATEN_VEC_ISA_AVX2=1",
             "-mavx2",
             "-mfma",
+        ]
+
+    if selected_isa == "sve256":
+        if os.name == "nt":
+            raise ValueError("CODA_CPU_ATEN_VEC_ISA=sve256 requires a POSIX AArch64 toolchain")
+        return [
+            "-DCODA_CPU_WITH_ATEN_VEC=1",
+            "-DCPU_CAPABILITY=SVE",
+            "-DCPU_CAPABILITY_SVE=1",
+            "-DCPU_CAPABILITY_SVE256=1",
+            "-DCODA_CPU_ATEN_VEC_ISA_SVE256=1",
+            "-DAT_BUILD_ARM_VEC256_WITH_SLEEF=1",
+            "-march=armv8-a+sve+bf16",
+            "-msve-vector-bits=256",
         ]
 
     if os.name == "nt":
@@ -319,6 +381,21 @@ def _first_existing(paths: list[Path], marker: str | None = None) -> Path | None
     return None
 
 
+def _linux_multiarch_library_dirs() -> list[Path]:
+    if os.name != "posix":
+        return []
+    machine = platform.machine().lower()
+    triples = {
+        "aarch64": "aarch64-linux-gnu",
+        "arm64": "aarch64-linux-gnu",
+        "x86_64": "x86_64-linux-gnu",
+        "amd64": "x86_64-linux-gnu",
+        "s390x": "s390x-linux-gnu",
+    }
+    triple = triples.get(machine)
+    return [Path("/usr/lib") / triple] if triple else []
+
+
 def _onednn_paths() -> tuple[Path | None, Path | None]:
     root = _repo_root()
     include_dir = os.environ.get("DNNL_INCLUDE_DIR")
@@ -339,7 +416,7 @@ def _onednn_paths() -> tuple[Path | None, Path | None]:
             root / "third_party" / "onednn" / "build" / "src",
             Path("/usr/lib"),
             Path("/usr/local/lib"),
-            Path("/usr/lib/x86_64-linux-gnu"),
+            *_linux_multiarch_library_dirs(),
         ],
     )
     return include_path, library_path
@@ -383,7 +460,7 @@ def _libxsmm_paths() -> tuple[Path | None, Path | None]:
             root / "third_party" / "libxsmm",
             Path("/usr/lib"),
             Path("/usr/local/lib"),
-            Path("/usr/lib/x86_64-linux-gnu"),
+            *_linux_multiarch_library_dirs(),
             Path("/opt/homebrew/lib"),
         ],
     )
