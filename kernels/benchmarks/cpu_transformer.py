@@ -195,7 +195,7 @@ def main() -> None:
         except Exception as exc:
             print(f"torch/compiled: skipped ({type(exc).__name__}: {exc})")
 
-    for provider in ("aten", "onednn-x64-brgemm", "libxsmm"):
+    for provider in ("aten", "aten-vec", "onednn-x64-brgemm", "libxsmm"):
         try:
             select_provider(provider)
         except RuntimeError as exc:

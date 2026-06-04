@@ -85,6 +85,7 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
 class CpuBackendFeatures:
     machine: str
     processor: str
+    torch_cpu_capability: str
     flags: frozenset[str]
     has_avx2: bool
     has_avx512: bool
@@ -105,15 +106,27 @@ def _cpu_flags() -> frozenset[str]:
     return frozenset()
 
 
+def _torch_cpu_capability() -> str:
+    try:
+        get_capability = getattr(torch.backends.cpu, "get_cpu_capability", None)
+        if get_capability is None:
+            return ""
+        return str(get_capability()).lower()
+    except Exception:
+        return ""
+
+
 @lru_cache(maxsize=1)
 def detect_features() -> CpuBackendFeatures:
     flags = _cpu_flags()
+    torch_capability = _torch_cpu_capability()
     return CpuBackendFeatures(
         machine=platform.machine().lower(),
         processor=platform.processor().lower(),
+        torch_cpu_capability=torch_capability,
         flags=flags,
-        has_avx2="avx2" in flags,
-        has_avx512=any(flag.startswith("avx512") for flag in flags),
+        has_avx2="avx2" in flags or "avx2" in torch_capability or "avx512" in torch_capability,
+        has_avx512=any(flag.startswith("avx512") for flag in flags) or "avx512" in torch_capability,
         has_amx=any(flag.startswith("amx") for flag in flags),
         has_libxsmm_python=importlib.util.find_spec("libxsmm") is not None,
         has_onednn_python=any(
@@ -327,6 +340,143 @@ class AtenFallbackProvider(CpuGemmProvider):
         return True
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"0", "false", "no", "off", ""}
+
+
+def _is_contiguous_f32(tensor: object) -> bool:
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    return (
+        tensor.device.type == "cpu"
+        and tensor.dtype == torch.float32
+        and tensor.is_contiguous()
+    )
+
+
+def _is_contiguous_i64(tensor: object) -> bool:
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    return (
+        tensor.device.type == "cpu"
+        and tensor.dtype == torch.long
+        and tensor.is_contiguous()
+    )
+
+
+class AtenVecProvider(CpuGemmProvider):
+    name = "aten-vec"
+
+    @classmethod
+    def is_available(cls, features: CpuBackendFeatures) -> bool:
+        native = load_native_extension()
+        return (
+            native is not None
+            and hasattr(native, "has_aten_vec")
+            and bool(native.has_aten_vec())
+        )
+
+    def _is_supported(
+        self,
+        program: GemmEpilogueProgram,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        tensors: dict[str, torch.Tensor],
+    ) -> bool:
+        if not _is_contiguous_f32(A) or not _is_contiguous_f32(B):
+            return False
+
+        nodes = program.nodes
+        if (
+            len(nodes) == 3
+            and nodes[0].op == EpilogueOp.RESIDUAL_ADD
+            and nodes[1].op == EpilogueOp.BLOCK_MEAN_SQUARE_REDUCTION
+            and nodes[2].op == EpilogueOp.ROW_VECTOR_SCALE_SIDE_OUTPUT
+        ):
+            return (
+                _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
+                and _is_contiguous_f32(tensors.get(_require_name(nodes[2].tensor)))
+            )
+
+        if len(nodes) == 1 and nodes[0].op in {
+            EpilogueOp.ROW_SCALE,
+            EpilogueOp.SWIGLU,
+            EpilogueOp.ROPE,
+        }:
+            if nodes[0].op == EpilogueOp.ROW_SCALE:
+                return _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
+            if nodes[0].op == EpilogueOp.ROPE:
+                return _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
+            return True
+
+        if len(nodes) == 2 and nodes[0].op == EpilogueOp.ROW_SCALE and nodes[1].op in {
+            EpilogueOp.SWIGLU,
+            EpilogueOp.ROPE,
+        }:
+            if not _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor))):
+                return False
+            if nodes[1].op == EpilogueOp.ROPE:
+                return _is_contiguous_f32(tensors.get(_require_name(nodes[1].tensor)))
+            return True
+
+        if (
+            len(nodes) == 2
+            and nodes[0].op == EpilogueOp.TARGET_LOGIT_SELECT
+            and nodes[1].op == EpilogueOp.BLOCK_LOGSUMEXP
+        ):
+            return _is_contiguous_i64(tensors.get(_require_name(nodes[0].tensor)))
+
+        if (
+            len(nodes) == 3
+            and nodes[0].op == EpilogueOp.ROW_SCALE
+            and nodes[1].op == EpilogueOp.TARGET_LOGIT_SELECT
+            and nodes[2].op == EpilogueOp.BLOCK_LOGSUMEXP
+        ):
+            return (
+                _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
+                and _is_contiguous_i64(tensors.get(_require_name(nodes[1].tensor)))
+            )
+
+        return False
+
+    def execute(
+        self,
+        program: GemmEpilogueProgram,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        **tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        native = load_native_extension()
+        supported = (
+            native is not None
+            and hasattr(native, "execute_aten_vec_postops")
+            and self._is_supported(
+                program,
+                A,
+                B,
+                tensors,
+            )
+        )
+        if not supported:
+            if _env_enabled("CODA_ATEN_VEC_STRICT"):
+                raise RuntimeError(
+                    "CPU provider 'aten-vec' only supports forward contiguous float32 inputs "
+                    "for the current transformer epilogue programs"
+                )
+            return super().execute(program, A, B, **tensors)
+
+        return native.execute_aten_vec_postops(
+            program.name,
+            program.to_native(),
+            A,
+            B,
+            tensors,
+        )
+
+
 class OneDnnX64BrgemmProvider(CpuGemmProvider):
     name = "onednn-x64-brgemm"
 
@@ -394,6 +544,7 @@ class LibxsmmProvider(CpuGemmProvider):
 
 _PROVIDER_CLASSES: tuple[type[CpuGemmProvider], ...] = (
     AtenFallbackProvider,
+    AtenVecProvider,
     OneDnnX64BrgemmProvider,
     LibxsmmProvider,
 )

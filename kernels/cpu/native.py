@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import shlex
 import os
+import subprocess
+import tempfile
 from ctypes.util import find_library
 from functools import lru_cache
 from pathlib import Path
@@ -26,15 +28,25 @@ def load_native_extension():
     if os.environ.get("CODA_CPU_JIT_BUILD") != "1":
         return None
 
+    compiler_env = _torch_extension_compiler_env()
+    if compiler_env is None:
+        return None
+
     try:
         from torch.utils.cpp_extension import load
     except Exception:
         return None
 
     native_dir = Path(__file__).with_name("native")
-    extra_cflags = ["/std:c++17"] if os.name == "nt" else ["-std=c++17"]
+    extra_cflags = ["/O2", "/DNDEBUG"] if os.name == "nt" else ["-O3", "-DNDEBUG"]
     extra_include_paths = [str(native_dir)]
     extra_ldflags: list[str] = []
+
+    if os.environ.get("CODA_CPU_WITH_ATEN_VEC") == "1":
+        extra_cflags.extend(_aten_vec_cflags())
+        extra_cflags.extend(_aten_vec_cache_cflags())
+        extra_cflags.extend(_aten_vec_parallel_cflags())
+        extra_ldflags.extend(_aten_vec_parallel_ldflags())
 
     if os.environ.get("CODA_CPU_WITH_ONEDNN") == "1" and _can_enable_onednn():
         include_dir, library_dir = _onednn_paths()
@@ -64,19 +76,29 @@ def load_native_extension():
         libxsmm_libs = libs or _default_libxsmm_libs(library_dir)
         extra_ldflags.extend(_normalize_libs(libxsmm_libs))
 
-    return load(
-        name="_coda_cpu_native",
-        sources=[
-            str(native_dir / "bindings.cpp"),
-            str(native_dir / "coda_post_ops.cpp"),
-            str(native_dir / "coda_brgemm.cpp"),
-            str(native_dir / "coda_libxsmm.cpp"),
-        ],
-        extra_cflags=extra_cflags,
-        extra_include_paths=extra_include_paths,
-        extra_ldflags=extra_ldflags,
-        verbose=bool(int(os.environ.get("CODA_CPU_JIT_VERBOSE", "0"))),
-    )
+    previous_env = {key: os.environ.get(key) for key in compiler_env}
+    os.environ.update(compiler_env)
+    try:
+        return load(
+            name="_coda_cpu_native",
+            sources=[
+                str(native_dir / "bindings.cpp"),
+                str(native_dir / "coda_post_ops.cpp"),
+                str(native_dir / "coda_aten_vec.cpp"),
+                str(native_dir / "coda_brgemm.cpp"),
+                str(native_dir / "coda_libxsmm.cpp"),
+            ],
+            extra_cflags=extra_cflags,
+            extra_include_paths=extra_include_paths,
+            extra_ldflags=extra_ldflags,
+            verbose=bool(int(os.environ.get("CODA_CPU_JIT_VERBOSE", "0"))),
+        )
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _split_libs(value: str | None) -> list[str]:
@@ -101,6 +123,193 @@ def _normalize_libs(libs: list[str]) -> list[str]:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _compiler_accepts(compiler: list[str], standard: str) -> bool:
+    try:
+        result = subprocess.run(
+            [*compiler, standard, "-x", "c++", "-", "-fsyntax-only"],
+            input="int main() { return 0; }\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return False
+    return result.returncode == 0
+
+
+def _torch_extension_compiler_env() -> dict[str, str] | None:
+    if os.name != "posix":
+        return {}
+
+    compiler = shlex.split(os.environ.get("CXX", "c++"))
+    if _compiler_accepts(compiler, "-std=c++20"):
+        return {}
+    if not _compiler_accepts(compiler, "-std=c++2a"):
+        return None
+
+    wrapper = _cxx2a_compat_wrapper(compiler)
+    return {"CXX": str(wrapper)}
+
+
+def _cxx2a_compat_wrapper(compiler: list[str]) -> Path:
+    wrapper_dir = Path(tempfile.gettempdir()) / "coda-cxx20-compat"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = wrapper_dir / "cxx"
+    content = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -e",
+            "args=()",
+            'for arg in "$@"; do',
+            '  if [ "$arg" = "-std=c++20" ]; then',
+            '    args+=("-std=c++2a")',
+            "  else",
+            '    args+=("$arg")',
+            "  fi",
+            "done",
+            f'exec {shlex.join(compiler)} "${{args[@]}}"',
+            "",
+        ]
+    )
+    if not wrapper.exists() or wrapper.read_text(encoding="utf-8") != content:
+        wrapper.write_text(content, encoding="utf-8", newline="\n")
+        wrapper.chmod(0o755)
+    return wrapper
+
+
+def _torch_cpu_capability() -> str:
+    try:
+        import torch
+
+        get_capability = getattr(getattr(torch, "backends", None), "cpu", None)
+        if get_capability is None:
+            return ""
+        capability_fn = getattr(get_capability, "get_cpu_capability", None)
+        if capability_fn is None:
+            return ""
+        return str(capability_fn()).upper()
+    except Exception:
+        return ""
+
+
+def _supports_avx2() -> bool:
+    capability = _torch_cpu_capability()
+    if "AVX512" in capability or "AVX2" in capability:
+        return True
+    if os.name == "posix":
+        try:
+            flags = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
+            return "avx2" in flags
+        except OSError:
+            return False
+    return False
+
+
+def _aten_vec_cflags() -> list[str]:
+    requested_isa = os.environ.get("CODA_CPU_ATEN_VEC_ISA", "auto").lower()
+    use_avx2 = requested_isa == "avx2" or (requested_isa == "auto" and _supports_avx2())
+
+    if requested_isa == "generic":
+        use_avx2 = False
+    elif requested_isa not in {"auto", "avx2"}:
+        raise ValueError(f"unknown CODA_CPU_ATEN_VEC_ISA={requested_isa!r}")
+
+    if use_avx2:
+        if os.name == "nt":
+            return [
+                "/DCODA_CPU_WITH_ATEN_VEC=1",
+                "/DCPU_CAPABILITY=AVX2",
+                "/DCPU_CAPABILITY_AVX2=1",
+                "/DCODA_CPU_ATEN_VEC_ISA_AVX2=1",
+                "/arch:AVX2",
+            ]
+        return [
+            "-DCODA_CPU_WITH_ATEN_VEC=1",
+            "-DCPU_CAPABILITY=AVX2",
+            "-DCPU_CAPABILITY_AVX2=1",
+            "-DCODA_CPU_ATEN_VEC_ISA_AVX2=1",
+            "-mavx2",
+            "-mfma",
+        ]
+
+    if os.name == "nt":
+        return [
+            "/DCODA_CPU_WITH_ATEN_VEC=1",
+            "/DCPU_CAPABILITY=DEFAULT",
+            "/DCODA_CPU_ATEN_VEC_ISA_GENERIC=1",
+        ]
+    return [
+        "-DCODA_CPU_WITH_ATEN_VEC=1",
+        "-DCPU_CAPABILITY=DEFAULT",
+        "-DCODA_CPU_ATEN_VEC_ISA_GENERIC=1",
+    ]
+
+
+def _torch_parallel_backend() -> str:
+    try:
+        import torch
+
+        info = torch.__config__.parallel_info().lower()
+    except Exception:
+        return ""
+    if "aten parallel backend: openmp" in info:
+        return "openmp"
+    if "aten parallel backend: native" in info:
+        return "native"
+    return ""
+
+
+def _torch_cpu_cache_sizes() -> tuple[int, int]:
+    default = (32 * 1024, 512 * 1024)
+    try:
+        import torch
+
+        get_capabilities = getattr(getattr(torch, "cpu", None), "get_capabilities", None)
+        if get_capabilities is None:
+            return default
+        capabilities = get_capabilities()
+        l1 = int(capabilities.get("l1d_cache_size", default[0]))
+        l2 = int(capabilities.get("l2_cache_size", default[1]))
+        if l1 <= 0 or l2 <= 0:
+            return default
+        return l1, l2
+    except Exception:
+        return default
+
+
+def _aten_vec_cache_cflags() -> list[str]:
+    l1, l2 = _torch_cpu_cache_sizes()
+    if os.name == "nt":
+        return [
+            f"/DCODA_CPU_ATEN_VEC_L1_BYTES={l1}",
+            f"/DCODA_CPU_ATEN_VEC_L2_BYTES={l2}",
+        ]
+    return [
+        f"-DCODA_CPU_ATEN_VEC_L1_BYTES={l1}",
+        f"-DCODA_CPU_ATEN_VEC_L2_BYTES={l2}",
+    ]
+
+
+def _aten_vec_parallel_cflags() -> list[str]:
+    backend = _torch_parallel_backend()
+    if backend == "openmp":
+        if os.name == "nt":
+            return ["/DINTRA_OP_PARALLEL=1", "/DAT_PARALLEL_OPENMP=1", "/openmp"]
+        return ["-DINTRA_OP_PARALLEL=1", "-DAT_PARALLEL_OPENMP=1", "-fopenmp"]
+    if backend == "native":
+        if os.name == "nt":
+            return ["/DINTRA_OP_PARALLEL=1", "/DAT_PARALLEL_NATIVE=1"]
+        return ["-DINTRA_OP_PARALLEL=1", "-DAT_PARALLEL_NATIVE=1"]
+    return []
+
+
+def _aten_vec_parallel_ldflags() -> list[str]:
+    if _torch_parallel_backend() == "openmp" and os.name != "nt":
+        return ["-fopenmp"]
+    return []
 
 
 def _first_existing(paths: list[Path], marker: str | None = None) -> Path | None:

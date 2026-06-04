@@ -52,6 +52,8 @@ std::pair<at::Tensor, pybind11::dict> run_post_ops(
 
 bool has_onednn();
 bool has_libxsmm();
+bool has_aten_vec();
+std::string aten_vec_isa();
 
 std::pair<at::Tensor, pybind11::dict> execute_brgemm_postops(
         const std::string &program_name,
@@ -61,6 +63,13 @@ std::pair<at::Tensor, pybind11::dict> execute_brgemm_postops(
         const pybind11::dict &tensors);
 
 std::pair<at::Tensor, pybind11::dict> execute_libxsmm_postops(
+        const std::string &program_name,
+        const pybind11::list &nodes,
+        const at::Tensor &A,
+        const at::Tensor &B,
+        const pybind11::dict &tensors);
+
+std::pair<at::Tensor, pybind11::dict> execute_aten_vec_postops(
         const std::string &program_name,
         const pybind11::list &nodes,
         const at::Tensor &A,
