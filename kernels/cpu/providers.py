@@ -384,8 +384,31 @@ def _is_contiguous_i64(tensor: object) -> bool:
     )
 
 
+def _is_contiguous_f32_or_bf16(tensor: object) -> bool:
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    return (
+        tensor.device.type == "cpu"
+        and tensor.dtype in {torch.float32, torch.bfloat16}
+        and tensor.is_contiguous()
+    )
+
+
+def _is_contiguous_of_dtype(tensor: object, dtype: torch.dtype) -> bool:
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    return (
+        tensor.device.type == "cpu"
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+    )
+
+
 class AtenVecProvider(CpuGemmProvider):
     name = "aten-vec"
+
+    def __init__(self):
+        super().__init__()
 
     @classmethod
     def is_available(cls, features: CpuBackendFeatures) -> bool:
@@ -403,8 +426,13 @@ class AtenVecProvider(CpuGemmProvider):
         B: torch.Tensor,
         tensors: dict[str, torch.Tensor],
     ) -> bool:
-        if not _is_contiguous_f32(A) or not _is_contiguous_f32(B):
+        if not _is_contiguous_f32_or_bf16(A) or not _is_contiguous_f32_or_bf16(B):
             return False
+        if A.dtype != B.dtype:
+            return False
+
+        def check(name: str | None) -> bool:
+            return _is_contiguous_f32_or_bf16(tensors.get(_require_name(name)))
 
         nodes = program.nodes
         if (
@@ -414,8 +442,8 @@ class AtenVecProvider(CpuGemmProvider):
             and nodes[2].op == EpilogueOp.ROW_VECTOR_SCALE_SIDE_OUTPUT
         ):
             return (
-                _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
-                and _is_contiguous_f32(tensors.get(_require_name(nodes[2].tensor)))
+                check(nodes[0].tensor)
+                and check(nodes[2].tensor)
             )
 
         if len(nodes) == 1 and nodes[0].op in {
@@ -424,19 +452,19 @@ class AtenVecProvider(CpuGemmProvider):
             EpilogueOp.ROPE,
         }:
             if nodes[0].op == EpilogueOp.ROW_SCALE:
-                return _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
+                return check(nodes[0].tensor)
             if nodes[0].op == EpilogueOp.ROPE:
-                return _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
+                return check(nodes[0].tensor)
             return True
 
         if len(nodes) == 2 and nodes[0].op == EpilogueOp.ROW_SCALE and nodes[1].op in {
             EpilogueOp.SWIGLU,
             EpilogueOp.ROPE,
         }:
-            if not _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor))):
+            if not check(nodes[0].tensor):
                 return False
             if nodes[1].op == EpilogueOp.ROPE:
-                return _is_contiguous_f32(tensors.get(_require_name(nodes[1].tensor)))
+                return check(nodes[1].tensor)
             return True
 
         if (
@@ -453,7 +481,7 @@ class AtenVecProvider(CpuGemmProvider):
             and nodes[2].op == EpilogueOp.BLOCK_LOGSUMEXP
         ):
             return (
-                _is_contiguous_f32(tensors.get(_require_name(nodes[0].tensor)))
+                check(nodes[0].tensor)
                 and _is_contiguous_i64(tensors.get(_require_name(nodes[1].tensor)))
             )
 
@@ -480,18 +508,20 @@ class AtenVecProvider(CpuGemmProvider):
         if not supported:
             if _env_enabled("CODA_ATEN_VEC_STRICT"):
                 raise RuntimeError(
-                    "CPU provider 'aten-vec' only supports forward contiguous float32 inputs "
+                    "CPU provider 'aten-vec' only supports forward contiguous float32/bfloat16 inputs "
                     "for the current transformer epilogue programs"
                 )
             return super().execute(program, A, B, **tensors)
 
-        return native.execute_aten_vec_postops(
+        out, side_outputs = native.execute_aten_vec_postops(
             program.name,
             program.to_native(),
             A,
             B,
             tensors,
         )
+
+        return out, side_outputs
 
 
 class OneDnnX64BrgemmProvider(CpuGemmProvider):

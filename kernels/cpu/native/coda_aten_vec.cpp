@@ -16,6 +16,7 @@
 
 #if defined(CODA_CPU_WITH_ATEN_VEC)
 #include <ATen/cpu/vec/vec.h>
+#include <ATen/cpu/vec/functional.h>
 #endif
 
 namespace py = pybind11;
@@ -84,19 +85,102 @@ std::unordered_map<PackedBKey, PackedBEntry, PackedBKeyHash> packed_b_cache;
 PackedBKey packed_b_key(const at::Tensor &B, int64_t block_n) {
     return PackedBKey{
             B.unsafeGetTensorImpl(),
-            B.data_ptr<float>(),
+            B.data_ptr(),
             B.size(0),
             B.size(1),
             B.stride(0),
             B.stride(1),
             block_n,
-            B.unsafeGetTensorImpl()->version_counter().current_version(),
+            B.is_inference() ? 0 : B.unsafeGetTensorImpl()->version_counter().current_version(),
     };
 }
 
 int64_t ceil_div(int64_t x, int64_t y) {
     return (x + y - 1) / y;
 }
+
+template <typename T>
+inline Vec load_vec_as_float(const T *ptr, int64_t count = Vec::size()) {
+    if constexpr (std::is_same_v<T, float>) {
+        return Vec::loadu(ptr, count);
+    } else {
+        auto bvec = at::vec::Vectorized<c10::BFloat16>::loadu(ptr, count);
+        return std::get<0>(at::vec::convert_to_float(bvec));
+    }
+}
+
+template <typename T>
+inline void store_float_as_vec(T *ptr, const Vec &fvec, int64_t count = Vec::size()) {
+    if constexpr (std::is_same_v<T, float>) {
+        fvec.store(ptr, count);
+    } else {
+        auto bvec = at::vec::convert_from_float<c10::BFloat16>(fvec, Vec(0.0f));
+        bvec.store(ptr, count);
+    }
+}
+
+template <typename T>
+struct PackedBType {
+    using type = float;
+};
+
+#if defined(__AVX512BF16__)
+template <>
+struct PackedBType<c10::BFloat16> {
+    using type = c10::BFloat16;
+};
+#endif
+
+template <typename T>
+inline int32_t load_a_pair(const T *a_base, int64_t row_offset, int64_t p, int64_t K) {
+    (void)K;
+    if constexpr (std::is_same_v<T, c10::BFloat16>) {
+        typedef int32_t __attribute__((__may_alias__)) aliased_int32_t;
+        return *reinterpret_cast<const aliased_int32_t*>(a_base + row_offset + 2 * p);
+    } else {
+        return 0;
+    }
+}
+
+#if defined(CODA_CPU_ATEN_VEC_ISA_AVX512)
+inline float vec_reduce_sum(const Vec &v) {
+    __m512 val = v.values;
+    __m256 ymm = _mm256_add_ps(_mm512_castps512_ps256(val), _mm512_extractf32x8_ps(val, 1));
+    __m128 xmm = _mm_add_ps(_mm256_castps256_ps128(ymm), _mm256_extractf128_ps(ymm, 1));
+    __m128 xmm_hi = _mm_movehl_ps(xmm, xmm);
+    xmm = _mm_add_ps(xmm, xmm_hi);
+    __m128 xmm_shuf = _mm_shuffle_ps(xmm, xmm, _MM_SHUFFLE(1, 1, 1, 1));
+    xmm = _mm_add_ss(xmm, xmm_shuf);
+    return _mm_cvtss_f32(xmm);
+}
+#else
+inline float vec_reduce_sum(const Vec &v) {
+    alignas(64) std::array<float, Vec::size()> scalar_values;
+    v.store(scalar_values.data());
+    float sum = 0.0f;
+    for (int64_t i = 0; i < Vec::size(); ++i) {
+        sum += scalar_values[i];
+    }
+    return sum;
+}
+#endif
+
+inline void atomic_add(float* address, float val) {
+    #if defined(__x86_64__) || defined(_M_X64)
+    union {
+        float f;
+        uint32_t i;
+    } old_val, new_val;
+    do {
+        old_val.f = *address;
+        new_val.f = old_val.f + val;
+    } while (!__sync_bool_compare_and_swap(reinterpret_cast<volatile uint32_t*>(address), old_val.i, new_val.i));
+    #else
+    #pragma omp atomic
+    *address += val;
+    #endif
+}
+
 
 const at::Tensor &require_tensor(const TensorMap &tensors, const std::string &name) {
     auto it = tensors.find(name);
@@ -113,10 +197,28 @@ std::string require_name(const std::string &name, const char *field) {
     return name;
 }
 
-void require_matrix(const at::Tensor &x, const char *name) {
+template <typename T>
+void require_matrix_template(const at::Tensor &x, const char *name) {
     TORCH_CHECK(x.device().is_cpu(), name, " must be a CPU tensor");
     TORCH_CHECK(x.dim() == 2, name, " must be a 2D tensor");
-    TORCH_CHECK(x.scalar_type() == at::kFloat, name, " must be float32");
+    if constexpr (std::is_same_v<T, float>) {
+        TORCH_CHECK(x.scalar_type() == at::kFloat, name, " must be float32");
+    } else {
+        TORCH_CHECK(x.scalar_type() == at::kBFloat16, name, " must be bfloat16");
+    }
+    TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
+}
+
+template <typename T>
+void require_vector_template(const at::Tensor &x, int64_t size, const char *name) {
+    TORCH_CHECK(x.device().is_cpu(), name, " must be a CPU tensor");
+    TORCH_CHECK(x.dim() == 1, name, " must be a 1D tensor");
+    TORCH_CHECK(x.size(0) == size, name, " has an unexpected shape");
+    if constexpr (std::is_same_v<T, float>) {
+        TORCH_CHECK(x.scalar_type() == at::kFloat, name, " must be float32");
+    } else {
+        TORCH_CHECK(x.scalar_type() == at::kBFloat16, name, " must be bfloat16");
+    }
     TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
 }
 
@@ -136,11 +238,15 @@ void require_targets(const at::Tensor &x, int64_t size, const char *name) {
     TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
 }
 
-void require_gemm_inputs(const at::Tensor &A, const at::Tensor &B) {
-    require_matrix(A, "A");
-    require_matrix(B, "B");
+template <typename T>
+void require_gemm_inputs_template(const at::Tensor &A, const at::Tensor &B) {
+    require_matrix_template<T>(A, "A");
+    require_matrix_template<T>(B, "B");
     TORCH_CHECK(A.size(1) == B.size(0), "incompatible GEMM shapes");
     TORCH_CHECK(A.size(1) > 0, "GEMM K dimension must be positive");
+    if constexpr (std::is_same_v<T, c10::BFloat16>) {
+        TORCH_CHECK(A.size(1) % 2 == 0, "BFloat16 GEMM K dimension must be even");
+    }
 }
 
 void update_logsumexp(float value, float &max_value, float &sum_exp) {
@@ -152,7 +258,7 @@ void update_logsumexp(float value, float &max_value, float &sum_exp) {
     }
 }
 
-template <int64_t col_vectors>
+template <typename T, int64_t col_vectors>
 at::Tensor pack_b_register_blocks(const at::Tensor &B) {
     const int64_t K = B.size(0);
     const int64_t N = B.size(1);
@@ -168,27 +274,74 @@ at::Tensor pack_b_register_blocks(const at::Tensor &B) {
         }
     }
 
-    auto packed = at::empty({num_blocks, K, block_n}, B.options().dtype(at::kFloat));
-    const float *b_base = B.data_ptr<float>();
-    float *packed_base = packed.data_ptr<float>();
+    using PackedT = typename PackedBType<T>::type;
 
-    at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t nb = begin; nb < end; ++nb) {
-            for (int64_t k = 0; k < K; ++k) {
-                float *packed_row = packed_base + (nb * K + k) * block_n;
-                for (int64_t c = 0; c < col_vectors; ++c) {
-                    const int64_t n = nb * block_n + c * vec_size;
-                    const int64_t count = std::max<int64_t>(
-                            0,
-                            std::min<int64_t>(vec_size, N - n));
-                    const Vec b_vec = count == 0
-                            ? Vec(0.0f)
-                            : Vec::loadu(b_base + k * N + n, count);
-                    b_vec.store(packed_row + c * vec_size);
+    at::Tensor packed;
+    if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
+        const int64_t K_padded = ceil_div(K, 2) * 2;
+        packed = at::empty({num_blocks, K_padded / 2, 2 * block_n}, B.options().dtype(at::kBFloat16));
+        const T *b_base = B.data_ptr<T>();
+        PackedT *packed_base = packed.data_ptr<PackedT>();
+
+        at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t nb = begin; nb < end; ++nb) {
+                for (int64_t p = 0; p < K_padded / 2; ++p) {
+                    const int64_t k0 = 2 * p;
+                    const int64_t k1 = 2 * p + 1;
+                    PackedT *packed_row = packed_base + (nb * (K_padded / 2) + p) * (2 * block_n);
+                    for (int64_t c = 0; c < col_vectors; ++c) {
+                        const int64_t n = nb * block_n + c * vec_size;
+                        const int64_t count = std::max<int64_t>(
+                                0,
+                                std::min<int64_t>(vec_size, N - n));
+                        if (count == 0) {
+                            std::fill_n(packed_row + c * 2 * vec_size, 2 * vec_size, static_cast<PackedT>(0.0f));
+                        } else {
+                            for (int64_t i = 0; i < count; ++i) {
+                                packed_row[c * 2 * vec_size + 2 * i] = static_cast<PackedT>(b_base[k0 * N + n + i]);
+                                if (k1 < K) {
+                                    packed_row[c * 2 * vec_size + 2 * i + 1] = static_cast<PackedT>(b_base[k1 * N + n + i]);
+                                } else {
+                                    packed_row[c * 2 * vec_size + 2 * i + 1] = static_cast<PackedT>(0.0f);
+                                }
+                            }
+                            if (count < vec_size) {
+                                std::fill_n(packed_row + c * 2 * vec_size + 2 * count, 2 * (vec_size - count), static_cast<PackedT>(0.0f));
+                            }
+                        }
+                    }
                 }
             }
-        }
-    });
+        });
+    } else {
+        packed = at::empty({num_blocks, K, block_n}, B.options().dtype(at::kFloat));
+        const T *b_base = B.data_ptr<T>();
+        float *packed_base = packed.data_ptr<float>();
+
+        at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t nb = begin; nb < end; ++nb) {
+                for (int64_t k = 0; k < K; ++k) {
+                    float *packed_row = packed_base + (nb * K + k) * block_n;
+                    for (int64_t c = 0; c < col_vectors; ++c) {
+                        const int64_t n = nb * block_n + c * vec_size;
+                        const int64_t count = std::max<int64_t>(
+                                0,
+                                std::min<int64_t>(vec_size, N - n));
+                        if (count == 0) {
+                            std::fill_n(packed_row + c * vec_size, vec_size, 0.0f);
+                        } else {
+                            for (int64_t i = 0; i < count; ++i) {
+                                packed_row[c * vec_size + i] = static_cast<float>(b_base[k * N + n + i]);
+                            }
+                            if (count < vec_size) {
+                                std::fill_n(packed_row + c * vec_size + count, vec_size - count, 0.0f);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     {
         std::lock_guard<std::mutex> lock(packed_b_cache_mutex);
@@ -209,130 +362,522 @@ inline void static_for(const Fn &fn) {
     }
 }
 
-template <bool accumulate>
-inline Vec load_accumulator(const float *ptr) {
+template <typename T, bool accumulate>
+inline Vec load_accumulator(const T *ptr, int64_t count = Vec::size()) {
     if constexpr (accumulate) {
-        return Vec::loadu(ptr);
+        return load_vec_as_float<T>(ptr, count);
     } else {
         return Vec(0.0f);
     }
 }
 
-template <bool accumulate>
+template <typename T, bool accumulate>
 inline void gemm_microkernel_4x2(
-        const float *a_base,
-        const float *b_panel,
-        float *acc_base,
+        const T *a_base,
+        const typename PackedBType<T>::type *b_panel,
+        T *acc_base,
         int64_t K,
         int64_t k_begin,
         int64_t k_end) {
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t block_n = 2 * vec_size;
-    Vec c00 = load_accumulator<accumulate>(acc_base);
-    Vec c01 = load_accumulator<accumulate>(acc_base + vec_size);
-    Vec c10 = load_accumulator<accumulate>(acc_base + block_n);
-    Vec c11 = load_accumulator<accumulate>(acc_base + block_n + vec_size);
-    Vec c20 = load_accumulator<accumulate>(acc_base + 2 * block_n);
-    Vec c21 = load_accumulator<accumulate>(acc_base + 2 * block_n + vec_size);
-    Vec c30 = load_accumulator<accumulate>(acc_base + 3 * block_n);
-    Vec c31 = load_accumulator<accumulate>(acc_base + 3 * block_n + vec_size);
+    Vec c00 = load_accumulator<T, accumulate>(acc_base);
+    Vec c01 = load_accumulator<T, accumulate>(acc_base + vec_size);
+    Vec c10 = load_accumulator<T, accumulate>(acc_base + block_n);
+    Vec c11 = load_accumulator<T, accumulate>(acc_base + block_n + vec_size);
+    Vec c20 = load_accumulator<T, accumulate>(acc_base + 2 * block_n);
+    Vec c21 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + vec_size);
+    Vec c30 = load_accumulator<T, accumulate>(acc_base + 3 * block_n);
+    Vec c31 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + vec_size);
 
-    for (int64_t k = k_begin; k < k_end; ++k) {
-        const Vec b0 = Vec::loadu(b_panel + k * block_n);
-        const Vec b1 = Vec::loadu(b_panel + k * block_n + vec_size);
-        Vec a(a_base[k]);
-        c00 = at::vec::fmadd(a, b0, c00);
-        c01 = at::vec::fmadd(a, b1, c01);
-        a = Vec(a_base[K + k]);
-        c10 = at::vec::fmadd(a, b0, c10);
-        c11 = at::vec::fmadd(a, b1, c11);
-        a = Vec(a_base[2 * K + k]);
-        c20 = at::vec::fmadd(a, b0, c20);
-        c21 = at::vec::fmadd(a, b1, c21);
-        a = Vec(a_base[3 * K + k]);
-        c30 = at::vec::fmadd(a, b0, c30);
-        c31 = at::vec::fmadd(a, b1, c31);
+    using PackedT = typename PackedBType<T>::type;
+    if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
+#if defined(__AVX512BF16__)
+        const int64_t p_begin = k_begin / 2;
+        const int64_t p_end = (k_end + 1) / 2;
+
+        __m512 c00_v = c00.values;
+        __m512 c01_v = c01.values;
+        __m512 c10_v = c10.values;
+        __m512 c11_v = c11.values;
+        __m512 c20_v = c20.values;
+        __m512 c21_v = c21.values;
+        __m512 c30_v = c30.values;
+        __m512 c31_v = c31.values;
+
+        for (int64_t p = p_begin; p < p_end; ++p) {
+            __m512 b0 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n));
+            __m512 b1 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 2));
+
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 0, p, K)));
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, K, p, K)));
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 2 * K, p, K)));
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 3 * K, p, K)));
+
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+        }
+
+        c00 = Vec(c00_v);
+        c01 = Vec(c01_v);
+        c10 = Vec(c10_v);
+        c11 = Vec(c11_v);
+        c20 = Vec(c20_v);
+        c21 = Vec(c21_v);
+        c30 = Vec(c30_v);
+        c31 = Vec(c31_v);
+#else
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+#endif
+    } else {
+        int64_t k = k_begin;
+        for (; k + 1 < k_end; k += 2) {
+            const Vec b0_0 = Vec::loadu(b_panel + k * block_n);
+            const Vec b1_0 = Vec::loadu(b_panel + k * block_n + vec_size);
+            const Vec b0_1 = Vec::loadu(b_panel + (k + 1) * block_n);
+            const Vec b1_1 = Vec::loadu(b_panel + (k + 1) * block_n + vec_size);
+
+            Vec a0(static_cast<float>(a_base[k]));
+            c00 = at::vec::fmadd(a0, b0_0, c00);
+            c01 = at::vec::fmadd(a0, b1_0, c01);
+            Vec a1(static_cast<float>(a_base[k + 1]));
+            c00 = at::vec::fmadd(a1, b0_1, c00);
+            c01 = at::vec::fmadd(a1, b1_1, c01);
+
+            a0 = Vec(static_cast<float>(a_base[K + k]));
+            c10 = at::vec::fmadd(a0, b0_0, c10);
+            c11 = at::vec::fmadd(a0, b1_0, c11);
+            a1 = Vec(static_cast<float>(a_base[K + k + 1]));
+            c10 = at::vec::fmadd(a1, b0_1, c10);
+            c11 = at::vec::fmadd(a1, b1_1, c11);
+
+            a0 = Vec(static_cast<float>(a_base[2 * K + k]));
+            c20 = at::vec::fmadd(a0, b0_0, c20);
+            c21 = at::vec::fmadd(a0, b1_0, c21);
+            a1 = Vec(static_cast<float>(a_base[2 * K + k + 1]));
+            c20 = at::vec::fmadd(a1, b0_1, c20);
+            c21 = at::vec::fmadd(a1, b1_1, c21);
+
+            a0 = Vec(static_cast<float>(a_base[3 * K + k]));
+            c30 = at::vec::fmadd(a0, b0_0, c30);
+            c31 = at::vec::fmadd(a0, b1_0, c31);
+            a1 = Vec(static_cast<float>(a_base[3 * K + k + 1]));
+            c30 = at::vec::fmadd(a1, b0_1, c30);
+            c31 = at::vec::fmadd(a1, b1_1, c31);
+        }
+        for (; k < k_end; ++k) {
+            const Vec b0 = Vec::loadu(b_panel + k * block_n);
+            const Vec b1 = Vec::loadu(b_panel + k * block_n + vec_size);
+            Vec a(static_cast<float>(a_base[k]));
+            c00 = at::vec::fmadd(a, b0, c00);
+            c01 = at::vec::fmadd(a, b1, c01);
+            a = Vec(static_cast<float>(a_base[K + k]));
+            c10 = at::vec::fmadd(a, b0, c10);
+            c11 = at::vec::fmadd(a, b1, c11);
+            a = Vec(static_cast<float>(a_base[2 * K + k]));
+            c20 = at::vec::fmadd(a, b0, c20);
+            c21 = at::vec::fmadd(a, b1, c21);
+            a = Vec(static_cast<float>(a_base[3 * K + k]));
+            c30 = at::vec::fmadd(a, b0, c30);
+            c31 = at::vec::fmadd(a, b1, c31);
+        }
     }
 
-    c00.store(acc_base);
-    c01.store(acc_base + vec_size);
-    c10.store(acc_base + block_n);
-    c11.store(acc_base + block_n + vec_size);
-    c20.store(acc_base + 2 * block_n);
-    c21.store(acc_base + 2 * block_n + vec_size);
-    c30.store(acc_base + 3 * block_n);
-    c31.store(acc_base + 3 * block_n + vec_size);
+    store_float_as_vec<T>(acc_base, c00);
+    store_float_as_vec<T>(acc_base + vec_size, c01);
+    store_float_as_vec<T>(acc_base + block_n, c10);
+    store_float_as_vec<T>(acc_base + block_n + vec_size, c11);
+    store_float_as_vec<T>(acc_base + 2 * block_n, c20);
+    store_float_as_vec<T>(acc_base + 2 * block_n + vec_size, c21);
+    store_float_as_vec<T>(acc_base + 3 * block_n, c30);
+    store_float_as_vec<T>(acc_base + 3 * block_n + vec_size, c31);
 }
 
-template <bool accumulate>
+template <typename T, bool accumulate>
 inline void gemm_microkernel_4x3(
-        const float *a_base,
-        const float *b_panel,
-        float *acc_base,
+        const T *a_base,
+        const typename PackedBType<T>::type *b_panel,
+        T *acc_base,
         int64_t K,
         int64_t k_begin,
         int64_t k_end) {
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t block_n = 3 * vec_size;
-    Vec c00 = load_accumulator<accumulate>(acc_base);
-    Vec c01 = load_accumulator<accumulate>(acc_base + vec_size);
-    Vec c02 = load_accumulator<accumulate>(acc_base + 2 * vec_size);
-    Vec c10 = load_accumulator<accumulate>(acc_base + block_n);
-    Vec c11 = load_accumulator<accumulate>(acc_base + block_n + vec_size);
-    Vec c12 = load_accumulator<accumulate>(acc_base + block_n + 2 * vec_size);
-    Vec c20 = load_accumulator<accumulate>(acc_base + 2 * block_n);
-    Vec c21 = load_accumulator<accumulate>(acc_base + 2 * block_n + vec_size);
-    Vec c22 = load_accumulator<accumulate>(acc_base + 2 * block_n + 2 * vec_size);
-    Vec c30 = load_accumulator<accumulate>(acc_base + 3 * block_n);
-    Vec c31 = load_accumulator<accumulate>(acc_base + 3 * block_n + vec_size);
-    Vec c32 = load_accumulator<accumulate>(acc_base + 3 * block_n + 2 * vec_size);
+    Vec c00 = load_accumulator<T, accumulate>(acc_base);
+    Vec c01 = load_accumulator<T, accumulate>(acc_base + vec_size);
+    Vec c02 = load_accumulator<T, accumulate>(acc_base + 2 * vec_size);
+    Vec c10 = load_accumulator<T, accumulate>(acc_base + block_n);
+    Vec c11 = load_accumulator<T, accumulate>(acc_base + block_n + vec_size);
+    Vec c12 = load_accumulator<T, accumulate>(acc_base + block_n + 2 * vec_size);
+    Vec c20 = load_accumulator<T, accumulate>(acc_base + 2 * block_n);
+    Vec c21 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + vec_size);
+    Vec c22 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + 2 * vec_size);
+    Vec c30 = load_accumulator<T, accumulate>(acc_base + 3 * block_n);
+    Vec c31 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + vec_size);
+    Vec c32 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + 2 * vec_size);
 
-    for (int64_t k = k_begin; k < k_end; ++k) {
-        const Vec b0 = Vec::loadu(b_panel + k * block_n);
-        const Vec b1 = Vec::loadu(b_panel + k * block_n + vec_size);
-        const Vec b2 = Vec::loadu(b_panel + k * block_n + 2 * vec_size);
-        Vec a(a_base[k]);
-        c00 = at::vec::fmadd(a, b0, c00);
-        c01 = at::vec::fmadd(a, b1, c01);
-        c02 = at::vec::fmadd(a, b2, c02);
-        a = Vec(a_base[K + k]);
-        c10 = at::vec::fmadd(a, b0, c10);
-        c11 = at::vec::fmadd(a, b1, c11);
-        c12 = at::vec::fmadd(a, b2, c12);
-        a = Vec(a_base[2 * K + k]);
-        c20 = at::vec::fmadd(a, b0, c20);
-        c21 = at::vec::fmadd(a, b1, c21);
-        c22 = at::vec::fmadd(a, b2, c22);
-        a = Vec(a_base[3 * K + k]);
-        c30 = at::vec::fmadd(a, b0, c30);
-        c31 = at::vec::fmadd(a, b1, c31);
-        c32 = at::vec::fmadd(a, b2, c32);
+    using PackedT = typename PackedBType<T>::type;
+    if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
+#if defined(__AVX512BF16__)
+        const int64_t p_begin = k_begin / 2;
+        const int64_t p_end = (k_end + 1) / 2;
+
+        __m512 c00_v = c00.values;
+        __m512 c01_v = c01.values;
+        __m512 c02_v = c02.values;
+        __m512 c10_v = c10.values;
+        __m512 c11_v = c11.values;
+        __m512 c12_v = c12.values;
+        __m512 c20_v = c20.values;
+        __m512 c21_v = c21.values;
+        __m512 c22_v = c22.values;
+        __m512 c30_v = c30.values;
+        __m512 c31_v = c31.values;
+        __m512 c32_v = c32.values;
+
+        for (int64_t p = p_begin; p < p_end; ++p) {
+            __m512 b0 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n));
+            __m512 b1 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 2));
+            __m512 b2 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 4));
+
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 0, p, K)));
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, K, p, K)));
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 2 * K, p, K)));
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 3 * K, p, K)));
+
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+        }
+
+        c00 = Vec(c00_v);
+        c01 = Vec(c01_v);
+        c02 = Vec(c02_v);
+        c10 = Vec(c10_v);
+        c11 = Vec(c11_v);
+        c12 = Vec(c12_v);
+        c20 = Vec(c20_v);
+        c21 = Vec(c21_v);
+        c22 = Vec(c22_v);
+        c30 = Vec(c30_v);
+        c31 = Vec(c31_v);
+        c32 = Vec(c32_v);
+#else
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+#endif
+    } else {
+        int64_t k = k_begin;
+        for (; k + 1 < k_end; k += 2) {
+            const Vec b0_0 = Vec::loadu(b_panel + k * block_n);
+            const Vec b1_0 = Vec::loadu(b_panel + k * block_n + vec_size);
+            const Vec b2_0 = Vec::loadu(b_panel + k * block_n + 2 * vec_size);
+            const Vec b0_1 = Vec::loadu(b_panel + (k + 1) * block_n);
+            const Vec b1_1 = Vec::loadu(b_panel + (k + 1) * block_n + vec_size);
+            const Vec b2_1 = Vec::loadu(b_panel + (k + 1) * block_n + 2 * vec_size);
+
+            Vec a0(static_cast<float>(a_base[k]));
+            c00 = at::vec::fmadd(a0, b0_0, c00);
+            c01 = at::vec::fmadd(a0, b1_0, c01);
+            c02 = at::vec::fmadd(a0, b2_0, c02);
+            Vec a1(static_cast<float>(a_base[k + 1]));
+            c00 = at::vec::fmadd(a1, b0_1, c00);
+            c01 = at::vec::fmadd(a1, b1_1, c01);
+            c02 = at::vec::fmadd(a1, b2_1, c02);
+
+            a0 = Vec(static_cast<float>(a_base[K + k]));
+            c10 = at::vec::fmadd(a0, b0_0, c10);
+            c11 = at::vec::fmadd(a0, b1_0, c11);
+            c12 = at::vec::fmadd(a0, b2_0, c12);
+            a1 = Vec(static_cast<float>(a_base[K + k + 1]));
+            c10 = at::vec::fmadd(a1, b0_1, c10);
+            c11 = at::vec::fmadd(a1, b1_1, c11);
+            c12 = at::vec::fmadd(a1, b2_1, c12);
+
+            a0 = Vec(static_cast<float>(a_base[2 * K + k]));
+            c20 = at::vec::fmadd(a0, b0_0, c20);
+            c21 = at::vec::fmadd(a0, b1_0, c21);
+            c22 = at::vec::fmadd(a0, b2_0, c22);
+            a1 = Vec(static_cast<float>(a_base[2 * K + k + 1]));
+            c20 = at::vec::fmadd(a1, b0_1, c20);
+            c21 = at::vec::fmadd(a1, b1_1, c21);
+            c22 = at::vec::fmadd(a1, b2_1, c22);
+
+            a0 = Vec(static_cast<float>(a_base[3 * K + k]));
+            c30 = at::vec::fmadd(a0, b0_0, c30);
+            c31 = at::vec::fmadd(a0, b1_0, c31);
+            c32 = at::vec::fmadd(a0, b2_0, c32);
+            a1 = Vec(static_cast<float>(a_base[3 * K + k + 1]));
+            c30 = at::vec::fmadd(a1, b0_1, c30);
+            c31 = at::vec::fmadd(a1, b1_1, c31);
+            c32 = at::vec::fmadd(a1, b2_1, c32);
+        }
+        for (; k < k_end; ++k) {
+            const Vec b0 = Vec::loadu(b_panel + k * block_n);
+            const Vec b1 = Vec::loadu(b_panel + k * block_n + vec_size);
+            const Vec b2 = Vec::loadu(b_panel + k * block_n + 2 * vec_size);
+            Vec a(static_cast<float>(a_base[k]));
+            c00 = at::vec::fmadd(a, b0, c00);
+            c01 = at::vec::fmadd(a, b1, c01);
+            c02 = at::vec::fmadd(a, b2, c02);
+            a = Vec(static_cast<float>(a_base[K + k]));
+            c10 = at::vec::fmadd(a, b0, c10);
+            c11 = at::vec::fmadd(a, b1, c11);
+            c12 = at::vec::fmadd(a, b2, c12);
+            a = Vec(static_cast<float>(a_base[2 * K + k]));
+            c20 = at::vec::fmadd(a, b0, c20);
+            c21 = at::vec::fmadd(a, b1, c21);
+            c22 = at::vec::fmadd(a, b2, c22);
+            a = Vec(static_cast<float>(a_base[3 * K + k]));
+            c30 = at::vec::fmadd(a, b0, c30);
+            c31 = at::vec::fmadd(a, b1, c31);
+            c32 = at::vec::fmadd(a, b2, c32);
+        }
     }
 
-    c00.store(acc_base);
-    c01.store(acc_base + vec_size);
-    c02.store(acc_base + 2 * vec_size);
-    c10.store(acc_base + block_n);
-    c11.store(acc_base + block_n + vec_size);
-    c12.store(acc_base + block_n + 2 * vec_size);
-    c20.store(acc_base + 2 * block_n);
-    c21.store(acc_base + 2 * block_n + vec_size);
-    c22.store(acc_base + 2 * block_n + 2 * vec_size);
-    c30.store(acc_base + 3 * block_n);
-    c31.store(acc_base + 3 * block_n + vec_size);
-    c32.store(acc_base + 3 * block_n + 2 * vec_size);
+    store_float_as_vec<T>(acc_base, c00);
+    store_float_as_vec<T>(acc_base + vec_size, c01);
+    store_float_as_vec<T>(acc_base + 2 * vec_size, c02);
+    store_float_as_vec<T>(acc_base + block_n, c10);
+    store_float_as_vec<T>(acc_base + block_n + vec_size, c11);
+    store_float_as_vec<T>(acc_base + block_n + 2 * vec_size, c12);
+    store_float_as_vec<T>(acc_base + 2 * block_n, c20);
+    store_float_as_vec<T>(acc_base + 2 * block_n + vec_size, c21);
+    store_float_as_vec<T>(acc_base + 2 * block_n + 2 * vec_size, c22);
+    store_float_as_vec<T>(acc_base + 3 * block_n, c30);
+    store_float_as_vec<T>(acc_base + 3 * block_n + vec_size, c31);
+    store_float_as_vec<T>(acc_base + 3 * block_n + 2 * vec_size, c32);
 }
 
-template <int64_t rows, int64_t col_vectors, bool accumulate>
+template <typename T, bool accumulate>
+inline void gemm_microkernel_4x4(
+        const T *a_base,
+        const typename PackedBType<T>::type *b_panel,
+        T *acc_base,
+        int64_t K,
+        int64_t k_begin,
+        int64_t k_end) {
+    constexpr int64_t vec_size = Vec::size();
+    constexpr int64_t block_n = 4 * vec_size;
+    Vec c00 = load_accumulator<T, accumulate>(acc_base);
+    Vec c01 = load_accumulator<T, accumulate>(acc_base + vec_size);
+    Vec c02 = load_accumulator<T, accumulate>(acc_base + 2 * vec_size);
+    Vec c03 = load_accumulator<T, accumulate>(acc_base + 3 * vec_size);
+    Vec c10 = load_accumulator<T, accumulate>(acc_base + block_n);
+    Vec c11 = load_accumulator<T, accumulate>(acc_base + block_n + vec_size);
+    Vec c12 = load_accumulator<T, accumulate>(acc_base + block_n + 2 * vec_size);
+    Vec c13 = load_accumulator<T, accumulate>(acc_base + block_n + 3 * vec_size);
+    Vec c20 = load_accumulator<T, accumulate>(acc_base + 2 * block_n);
+    Vec c21 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + vec_size);
+    Vec c22 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + 2 * vec_size);
+    Vec c23 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + 3 * vec_size);
+    Vec c30 = load_accumulator<T, accumulate>(acc_base + 3 * block_n);
+    Vec c31 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + vec_size);
+    Vec c32 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + 2 * vec_size);
+    Vec c33 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + 3 * vec_size);
+
+    using PackedT = typename PackedBType<T>::type;
+    if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
+#if defined(__AVX512BF16__)
+        const int64_t p_begin = k_begin / 2;
+        const int64_t p_end = (k_end + 1) / 2;
+        const int64_t p_end_fast = (k_end < K) ? p_end : (K / 2);
+
+        __m512 c00_v = c00.values;
+        __m512 c01_v = c01.values;
+        __m512 c02_v = c02.values;
+        __m512 c03_v = c03.values;
+        __m512 c10_v = c10.values;
+        __m512 c11_v = c11.values;
+        __m512 c12_v = c12.values;
+        __m512 c13_v = c13.values;
+        __m512 c20_v = c20.values;
+        __m512 c21_v = c21.values;
+        __m512 c22_v = c22.values;
+        __m512 c23_v = c23.values;
+        __m512 c30_v = c30.values;
+        __m512 c31_v = c31.values;
+        __m512 c32_v = c32.values;
+        __m512 c33_v = c33.values;
+
+        for (int64_t p = p_begin; p < p_end; ++p) {
+            __m512 b0 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n));
+            __m512 b1 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 2));
+            __m512 b2 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 4));
+            __m512 b3 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 6));
+
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 0, p, K)));
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, K, p, K)));
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 2 * K, p, K)));
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 3 * K, p, K)));
+
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+            c03_v = _mm512_dpbf16_ps(c03_v, (__m512bh)a0, (__m512bh)b3);
+
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+            c13_v = _mm512_dpbf16_ps(c13_v, (__m512bh)a1, (__m512bh)b3);
+
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+            c23_v = _mm512_dpbf16_ps(c23_v, (__m512bh)a2, (__m512bh)b3);
+
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+            c33_v = _mm512_dpbf16_ps(c33_v, (__m512bh)a3, (__m512bh)b3);
+        }
+
+        c00 = Vec(c00_v);
+        c01 = Vec(c01_v);
+        c02 = Vec(c02_v);
+        c03 = Vec(c03_v);
+        c10 = Vec(c10_v);
+        c11 = Vec(c11_v);
+        c12 = Vec(c12_v);
+        c13 = Vec(c13_v);
+        c20 = Vec(c20_v);
+        c21 = Vec(c21_v);
+        c22 = Vec(c22_v);
+        c23 = Vec(c23_v);
+        c30 = Vec(c30_v);
+        c31 = Vec(c31_v);
+        c32 = Vec(c32_v);
+        c33 = Vec(c33_v);
+#else
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+#endif
+    } else {
+        int64_t k = k_begin;
+        for (; k + 1 < k_end; k += 2) {
+            const Vec b0_0 = Vec::loadu(b_panel + k * block_n);
+            const Vec b1_0 = Vec::loadu(b_panel + k * block_n + vec_size);
+            const Vec b2_0 = Vec::loadu(b_panel + k * block_n + 2 * vec_size);
+            const Vec b3_0 = Vec::loadu(b_panel + k * block_n + 3 * vec_size);
+            const Vec b0_1 = Vec::loadu(b_panel + (k + 1) * block_n);
+            const Vec b1_1 = Vec::loadu(b_panel + (k + 1) * block_n + vec_size);
+            const Vec b2_1 = Vec::loadu(b_panel + (k + 1) * block_n + 2 * vec_size);
+            const Vec b3_1 = Vec::loadu(b_panel + (k + 1) * block_n + 3 * vec_size);
+
+            Vec a0(static_cast<float>(a_base[k]));
+            c00 = at::vec::fmadd(a0, b0_0, c00);
+            c01 = at::vec::fmadd(a0, b1_0, c01);
+            c02 = at::vec::fmadd(a0, b2_0, c02);
+            c03 = at::vec::fmadd(a0, b3_0, c03);
+            Vec a1(static_cast<float>(a_base[k + 1]));
+            c00 = at::vec::fmadd(a1, b0_1, c00);
+            c01 = at::vec::fmadd(a1, b1_1, c01);
+            c02 = at::vec::fmadd(a1, b2_1, c02);
+            c03 = at::vec::fmadd(a1, b3_1, c03);
+
+            a0 = Vec(static_cast<float>(a_base[K + k]));
+            c10 = at::vec::fmadd(a0, b0_0, c10);
+            c11 = at::vec::fmadd(a0, b1_0, c11);
+            c12 = at::vec::fmadd(a0, b2_0, c12);
+            c13 = at::vec::fmadd(a0, b3_0, c13);
+            a1 = Vec(static_cast<float>(a_base[K + k + 1]));
+            c10 = at::vec::fmadd(a1, b0_1, c10);
+            c11 = at::vec::fmadd(a1, b1_1, c11);
+            c12 = at::vec::fmadd(a1, b2_1, c12);
+            c13 = at::vec::fmadd(a1, b3_1, c13);
+
+            a0 = Vec(static_cast<float>(a_base[2 * K + k]));
+            c20 = at::vec::fmadd(a0, b0_0, c20);
+            c21 = at::vec::fmadd(a0, b1_0, c21);
+            c22 = at::vec::fmadd(a0, b2_0, c22);
+            c23 = at::vec::fmadd(a0, b3_0, c23);
+            a1 = Vec(static_cast<float>(a_base[2 * K + k + 1]));
+            c20 = at::vec::fmadd(a1, b0_1, c20);
+            c21 = at::vec::fmadd(a1, b1_1, c21);
+            c22 = at::vec::fmadd(a1, b2_1, c22);
+            c23 = at::vec::fmadd(a1, b3_1, c23);
+
+            a0 = Vec(static_cast<float>(a_base[3 * K + k]));
+            c30 = at::vec::fmadd(a0, b0_0, c30);
+            c31 = at::vec::fmadd(a0, b1_0, c31);
+            c32 = at::vec::fmadd(a0, b2_0, c32);
+            c33 = at::vec::fmadd(a0, b3_0, c33);
+            a1 = Vec(static_cast<float>(a_base[3 * K + k + 1]));
+            c30 = at::vec::fmadd(a1, b0_1, c30);
+            c31 = at::vec::fmadd(a1, b1_1, c31);
+            c32 = at::vec::fmadd(a1, b2_1, c32);
+            c33 = at::vec::fmadd(a1, b3_1, c33);
+        }
+        for (; k < k_end; ++k) {
+            const Vec b0 = Vec::loadu(b_panel + k * block_n);
+            const Vec b1 = Vec::loadu(b_panel + k * block_n + vec_size);
+            const Vec b2 = Vec::loadu(b_panel + k * block_n + 2 * vec_size);
+            const Vec b3 = Vec::loadu(b_panel + k * block_n + 3 * vec_size);
+            Vec a(static_cast<float>(a_base[k]));
+            c00 = at::vec::fmadd(a, b0, c00);
+            c01 = at::vec::fmadd(a, b1, c01);
+            c02 = at::vec::fmadd(a, b2, c02);
+            c03 = at::vec::fmadd(a, b3, c03);
+            a = Vec(static_cast<float>(a_base[K + k]));
+            c10 = at::vec::fmadd(a, b0, c10);
+            c11 = at::vec::fmadd(a, b1, c11);
+            c12 = at::vec::fmadd(a, b2, c12);
+            c13 = at::vec::fmadd(a, b3, c13);
+            a = Vec(static_cast<float>(a_base[2 * K + k]));
+            c20 = at::vec::fmadd(a, b0, c20);
+            c21 = at::vec::fmadd(a, b1, c21);
+            c22 = at::vec::fmadd(a, b2, c22);
+            c23 = at::vec::fmadd(a, b3, c23);
+            a = Vec(static_cast<float>(a_base[3 * K + k]));
+            c30 = at::vec::fmadd(a, b0, c30);
+            c31 = at::vec::fmadd(a, b1, c31);
+            c32 = at::vec::fmadd(a, b2, c32);
+            c33 = at::vec::fmadd(a, b3, c33);
+        }
+    }
+
+    store_float_as_vec<T>(acc_base, c00);
+    store_float_as_vec<T>(acc_base + vec_size, c01);
+    store_float_as_vec<T>(acc_base + 2 * vec_size, c02);
+    store_float_as_vec<T>(acc_base + 3 * vec_size, c03);
+    store_float_as_vec<T>(acc_base + block_n, c10);
+    store_float_as_vec<T>(acc_base + block_n + vec_size, c11);
+    store_float_as_vec<T>(acc_base + block_n + 2 * vec_size, c12);
+    store_float_as_vec<T>(acc_base + block_n + 3 * vec_size, c13);
+    store_float_as_vec<T>(acc_base + 2 * block_n, c20);
+    store_float_as_vec<T>(acc_base + 2 * block_n + vec_size, c21);
+    store_float_as_vec<T>(acc_base + 2 * block_n + 2 * vec_size, c22);
+    store_float_as_vec<T>(acc_base + 2 * block_n + 3 * vec_size, c23);
+    store_float_as_vec<T>(acc_base + 3 * block_n, c30);
+    store_float_as_vec<T>(acc_base + 3 * block_n + vec_size, c31);
+    store_float_as_vec<T>(acc_base + 3 * block_n + 2 * vec_size, c32);
+    store_float_as_vec<T>(acc_base + 3 * block_n + 3 * vec_size, c33);
+}
+
+template <typename T, int64_t rows, int64_t col_vectors, bool accumulate>
 inline void gemm_microkernel(
-        const float *a_base,
-        const float *b_panel,
-        float *acc_base,
+        const T *a_base,
+        const typename PackedBType<T>::type *b_panel,
+        T *acc_base,
         int64_t K,
         int64_t block_n,
         int64_t k_begin,
         int64_t k_end) {
     constexpr int64_t num_acc = rows * col_vectors;
+    constexpr int64_t vec_size = Vec::size();
     std::array<Vec, num_acc> acc;
     std::array<Vec, col_vectors> b_vecs;
     Vec a_vec;
@@ -340,51 +885,82 @@ inline void gemm_microkernel(
     static_for<0, num_acc>([&](auto index) {
         constexpr int64_t row = index / col_vectors;
         constexpr int64_t col = index % col_vectors;
-        if constexpr (accumulate) {
-            acc[index] = Vec::loadu(acc_base + row * block_n + col * Vec::size());
-        } else {
-            acc[index] = Vec(0.0f);
-        }
+        acc[index] = load_accumulator<T, accumulate>(acc_base + row * block_n + col * vec_size);
     });
 
-    for (int64_t k = k_begin; k < k_end; ++k) {
+    using PackedT = typename PackedBType<T>::type;
+    if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
+#if defined(__AVX512BF16__)
+        const int64_t p_begin = k_begin / 2;
+        const int64_t p_end = (k_end + 1) / 2;
+
+        std::array<__m512, num_acc> acc_v;
         static_for<0, num_acc>([&](auto index) {
-            constexpr int64_t row = index / col_vectors;
-            constexpr int64_t col = index % col_vectors;
-            if constexpr (col == 0) {
-                a_vec = Vec(a_base[row * K + k]);
-            }
-            if constexpr (row == 0) {
-                b_vecs[col] = Vec::loadu(b_panel + k * block_n + col * Vec::size());
-            }
-            acc[index] = at::vec::fmadd(a_vec, b_vecs[col], acc[index]);
+            acc_v[index] = acc[index].values;
         });
+
+        std::array<__m512, col_vectors> b_v;
+        for (int64_t p = p_begin; p < p_end; ++p) {
+            static_for<0, col_vectors>([&](auto col) {
+                b_v[col] = _mm512_loadu_ps(reinterpret_cast<const float*>(
+                        b_panel + p * 2 * block_n + col * vec_size * 2));
+            });
+
+            static_for<0, rows>([&](auto row) {
+                __m512 a_v = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, row * K, p, K)));
+                static_for<0, col_vectors>([&](auto col) {
+                    constexpr int64_t index = row * col_vectors + col;
+                    acc_v[index] = _mm512_dpbf16_ps(acc_v[index], (__m512bh)a_v, (__m512bh)b_v[col]);
+                });
+            });
+        }
+
+        static_for<0, num_acc>([&](auto index) {
+            acc[index] = Vec(acc_v[index]);
+        });
+#else
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+#endif
+    } else {
+        for (int64_t k = k_begin; k < k_end; ++k) {
+            static_for<0, num_acc>([&](auto index) {
+                constexpr int64_t row = index / col_vectors;
+                constexpr int64_t col = index % col_vectors;
+                if constexpr (col == 0) {
+                    a_vec = Vec(static_cast<float>(a_base[row * K + k]));
+                }
+                if constexpr (row == 0) {
+                    b_vecs[col] = Vec::loadu(b_panel + k * block_n + col * vec_size);
+                }
+                acc[index] = at::vec::fmadd(a_vec, b_vecs[col], acc[index]);
+            });
+        }
     }
 
     static_for<0, num_acc>([&](auto index) {
         constexpr int64_t row = index / col_vectors;
         constexpr int64_t col = index % col_vectors;
-        acc[index].store(acc_base + row * block_n + col * Vec::size());
+        store_float_as_vec<T>(acc_base + row * block_n + col * vec_size, acc[index]);
     });
 }
 
-template <int64_t col_vectors>
+template <typename T, int64_t col_vectors>
 inline void gemm_microkernel_rows(
         int64_t rows,
         bool accumulate,
-        const float *a_base,
-        const float *b_panel,
-        float *acc_base,
+        const T *a_base,
+        const typename PackedBType<T>::type *b_panel,
+        T *acc_base,
         int64_t K,
         int64_t block_n,
         int64_t k_begin,
         int64_t k_end) {
 #define CODA_CALL_MICROKERNEL(ROWS) \
     if (accumulate) { \
-        gemm_microkernel<ROWS, col_vectors, true>( \
+        gemm_microkernel<T, ROWS, col_vectors, true>( \
                 a_base, b_panel, acc_base, K, block_n, k_begin, k_end); \
     } else { \
-        gemm_microkernel<ROWS, col_vectors, false>( \
+        gemm_microkernel<T, ROWS, col_vectors, false>( \
                 a_base, b_panel, acc_base, K, block_n, k_begin, k_end); \
     }
 
@@ -401,18 +977,26 @@ inline void gemm_microkernel_rows(
         case 4:
             if constexpr (col_vectors == 2) {
                 if (accumulate) {
-                    gemm_microkernel_4x2<true>(
+                    gemm_microkernel_4x2<T, true>(
                             a_base, b_panel, acc_base, K, k_begin, k_end);
                 } else {
-                    gemm_microkernel_4x2<false>(
+                    gemm_microkernel_4x2<T, false>(
                             a_base, b_panel, acc_base, K, k_begin, k_end);
                 }
             } else if constexpr (col_vectors == 3) {
                 if (accumulate) {
-                    gemm_microkernel_4x3<true>(
+                    gemm_microkernel_4x3<T, true>(
                             a_base, b_panel, acc_base, K, k_begin, k_end);
                 } else {
-                    gemm_microkernel_4x3<false>(
+                    gemm_microkernel_4x3<T, false>(
+                            a_base, b_panel, acc_base, K, k_begin, k_end);
+                }
+            } else if constexpr (col_vectors == 4) {
+                if (accumulate) {
+                    gemm_microkernel_4x4<T, true>(
+                            a_base, b_panel, acc_base, K, k_begin, k_end);
+                } else {
+                    gemm_microkernel_4x4<T, false>(
                             a_base, b_panel, acc_base, K, k_begin, k_end);
                 }
             } else {
@@ -426,7 +1010,7 @@ inline void gemm_microkernel_rows(
 #undef CODA_CALL_MICROKERNEL
 }
 
-template <int64_t col_vectors, typename Visitor>
+template <typename T, int64_t col_vectors, typename Visitor>
 void visit_gemm_vectors_blocked(
         const at::Tensor &A,
         const at::Tensor &B,
@@ -435,7 +1019,7 @@ void visit_gemm_vectors_blocked(
     const int64_t M = A.size(0);
     const int64_t K = A.size(1);
     const int64_t N = B.size(1);
-    const float *a_base = A.data_ptr<float>();
+    const T *a_base = A.data_ptr<T>();
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t row_tile = 4;
     constexpr int64_t block_n = col_vectors * vec_size;
@@ -449,29 +1033,81 @@ void visit_gemm_vectors_blocked(
             row_tile,
             std::min<int64_t>(
                     kMaxMcRows,
-                    (kL2Budget / (K * static_cast<int64_t>(sizeof(float))) / row_tile) *
+                    (kL2Budget / (K * static_cast<int64_t>(sizeof(T))) / row_tile) *
                             row_tile));
-    const int64_t raw_kc = kL1Budget / (block_n * static_cast<int64_t>(sizeof(float)));
+    using PackedT = typename PackedBType<T>::type;
+    const int64_t raw_kc = kL1Budget / (block_n * static_cast<int64_t>(sizeof(PackedT)));
     const int64_t kc = std::min<int64_t>(
             K,
             std::max<int64_t>(64, (raw_kc / 64) * 64));
-    const auto packed_B = pack_b_register_blocks<col_vectors>(B);
-    const float *packed_base = packed_B.template data_ptr<float>();
+    const auto packed_B = pack_b_register_blocks<T, col_vectors>(B);
+    const PackedT *packed_base = packed_B.template data_ptr<PackedT>();
 
-    at::parallel_for(0, num_groups, 1, [&](int64_t begin, int64_t end) {
-        alignas(64) std::array<float, kMaxAccBufferSize> acc_buffer;
-        for (int64_t group = begin; group < end; ++group) {
-            const int64_t block_begin = group * group_blocks;
-            const int64_t block_end = std::min<int64_t>(num_blocks, block_begin + group_blocks);
-            for (int64_t m0 = 0; m0 < M; m0 += mc_rows) {
-                const int64_t rows = std::min<int64_t>(mc_rows, M - m0);
+    const int64_t K_padded = std::is_same_v<PackedT, c10::BFloat16> ? (ceil_div(K, 2) * 2) : K;
+    const int64_t b_panel_stride = K_padded * block_n;
+
+    if (num_groups > 1) {
+        at::parallel_for(0, num_groups, 1, [&](int64_t begin, int64_t end) {
+            alignas(64) std::array<T, kMaxMcRows * col_vectors * vec_size> acc_buffer;
+            for (int64_t g_idx = begin; g_idx < end; ++g_idx) {
+                const int64_t block_begin = g_idx * group_blocks;
+                const int64_t block_end = std::min<int64_t>(num_blocks, block_begin + group_blocks);
                 for (int64_t nb = block_begin; nb < block_end; ++nb) {
-                    const float *b_panel = packed_base + nb * K * block_n;
+                    const PackedT *b_panel = packed_base + nb * b_panel_stride;
+                    for (int64_t m0 = 0; m0 < M; m0 += mc_rows) {
+                        const int64_t rows = std::min<int64_t>(mc_rows, M - m0);
+                        for (int64_t k0 = 0; k0 < K; k0 += kc) {
+                            const int64_t k_end = std::min<int64_t>(K, k0 + kc);
+                            for (int64_t r0 = 0; r0 < rows; r0 += row_tile) {
+                                const int64_t micro_rows = std::min<int64_t>(row_tile, rows - r0);
+                                gemm_microkernel_rows<T, col_vectors>(
+                                        micro_rows,
+                                        k0 != 0,
+                                        a_base + (m0 + r0) * K,
+                                        b_panel,
+                                        acc_buffer.data() + r0 * block_n,
+                                        K,
+                                        block_n,
+                                        k0,
+                                        k_end);
+                            }
+                        }
+                        for (int64_t r = 0; r < rows; ++r) {
+                            const int64_t n = nb * block_n;
+                            const int64_t count = std::max<int64_t>(
+                                    0,
+                                    std::min<int64_t>(block_n, N - n));
+                            if (count > 0) {
+                                visitor(
+                                        m0 + r,
+                                        n,
+                                        count,
+                                        acc_buffer.data() + r * block_n);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        const int64_t dynamic_mc_rows = std::max<int64_t>(
+                row_tile,
+                std::min<int64_t>(
+                        mc_rows,
+                        (ceil_div(M, at::get_num_threads()) / row_tile) * row_tile));
+        const int64_t m_blocks = ceil_div(M, dynamic_mc_rows);
+        at::parallel_for(0, m_blocks, 1, [&](int64_t begin, int64_t end) {
+            alignas(64) std::array<T, kMaxMcRows * col_vectors * vec_size> acc_buffer;
+            for (int64_t m_idx = begin; m_idx < end; ++m_idx) {
+                const int64_t m0 = m_idx * dynamic_mc_rows;
+                const int64_t rows = std::min<int64_t>(dynamic_mc_rows, M - m0);
+                for (int64_t nb = 0; nb < num_blocks; ++nb) {
+                    const PackedT *b_panel = packed_base + nb * b_panel_stride;
                     for (int64_t k0 = 0; k0 < K; k0 += kc) {
                         const int64_t k_end = std::min<int64_t>(K, k0 + kc);
                         for (int64_t r0 = 0; r0 < rows; r0 += row_tile) {
                             const int64_t micro_rows = std::min<int64_t>(row_tile, rows - r0);
-                            gemm_microkernel_rows<col_vectors>(
+                            gemm_microkernel_rows<T, col_vectors>(
                                     micro_rows,
                                     k0 != 0,
                                     a_base + (m0 + r0) * K,
@@ -498,65 +1134,67 @@ void visit_gemm_vectors_blocked(
                     }
                 }
             }
-        }
-    });
+        });
+    }
 }
 
-template <typename Visitor>
+template <typename T, typename Visitor>
 void visit_gemm_vectors(
         const at::Tensor &A,
         const at::Tensor &B,
         const Visitor &visitor) {
-    visit_gemm_vectors_blocked<3>(A, B, visitor);
+    visit_gemm_vectors_blocked<T, 4>(A, B, visitor);
 }
 
-template <typename Visitor>
+template <typename T, typename Visitor>
 void visit_gemm_vectors_reduction(
         const at::Tensor &A,
         const at::Tensor &B,
         int64_t reduction_block_size,
         const Visitor &visitor) {
-    constexpr int64_t block_n = 3 * Vec::size();
+    constexpr int64_t block_n = 4 * Vec::size();
     const int64_t num_blocks = ceil_div(B.size(1), block_n);
     const int64_t aligned_group_blocks =
             std::lcm(reduction_block_size, block_n) / block_n;
     const int64_t target_group_blocks = ceil_div(num_blocks, at::get_num_threads());
     const int64_t group_blocks = aligned_group_blocks *
             std::max<int64_t>(1, target_group_blocks / aligned_group_blocks);
-    visit_gemm_vectors_blocked<3>(A, B, visitor, group_blocks);
+    visit_gemm_vectors_blocked<T, 4>(A, B, visitor, group_blocks);
 }
 
+template <typename T>
 at::Tensor execute_row_scale(
         const at::Tensor &A,
         const at::Tensor &B,
         const at::Tensor &R) {
-    require_gemm_inputs(A, B);
+    require_gemm_inputs_template<T>(A, B);
     require_vector(R, A.size(0), "R");
 
     const int64_t M = A.size(0);
     const int64_t N = B.size(1);
-    auto D = at::empty({M, N}, A.options().dtype(at::kFloat));
+    auto D = at::empty({M, N}, A.options().dtype(A.scalar_type()));
     const float *r_ptr = R.data_ptr<float>();
-    float *d_ptr = D.data_ptr<float>();
+    T *d_ptr = D.data_ptr<T>();
 
-    visit_gemm_vectors(A, B, [&](int64_t m, int64_t n, int64_t count, const float *values) {
-        float *d_row = d_ptr + m * N;
+    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+        T *d_row = d_ptr + m * N;
         const Vec scale(r_ptr[m]);
         for (int64_t i = 0; i < count; i += Vec::size()) {
             const int64_t width = std::min<int64_t>(Vec::size(), count - i);
-            const Vec value = Vec::loadu(values + i, width) * scale;
-            value.store(d_row + n + i, width);
+            const Vec value = load_vec_as_float(values + i, width) * scale;
+            store_float_as_vec(d_row + n + i, value, width);
         }
     });
 
     return D;
 }
 
+template <typename T>
 std::pair<at::Tensor, at::Tensor> execute_swiglu(
         const at::Tensor &A,
         const at::Tensor &B,
         const at::Tensor *R) {
-    require_gemm_inputs(A, B);
+    require_gemm_inputs_template<T>(A, B);
     if (R != nullptr) {
         require_vector(*R, A.size(0), "R");
     }
@@ -564,117 +1202,175 @@ std::pair<at::Tensor, at::Tensor> execute_swiglu(
 
     const int64_t M = A.size(0);
     const int64_t N = B.size(1);
-    auto D = at::empty({M, N}, A.options().dtype(at::kFloat));
-    auto O = at::empty({M, N / 2}, A.options().dtype(at::kFloat));
+    auto D = at::empty({M, N}, A.options().dtype(A.scalar_type()));
+    auto O = at::empty({M, N / 2}, A.options().dtype(A.scalar_type()));
     const float *r_ptr = R == nullptr ? nullptr : R->data_ptr<float>();
-    float *d_ptr = D.data_ptr<float>();
-    float *o_ptr = O.data_ptr<float>();
+    T *d_ptr = D.data_ptr<T>();
+    T *o_ptr = O.data_ptr<T>();
 
-    visit_gemm_vectors(A, B, [&](int64_t m, int64_t n, int64_t count, const float *values) {
-        float *d_row = d_ptr + m * N;
-        float *o_row = o_ptr + m * (N / 2);
-        const Vec scale(r_ptr == nullptr ? 1.0f : r_ptr[m]);
+    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+        T *d_row = d_ptr + m * N;
+        T *o_row = o_ptr + m * (N / 2);
         int64_t i = 0;
-        for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
-            const Vec value0 = Vec::loadu(values + i) * scale;
-            const Vec value1 = Vec::loadu(values + i + Vec::size()) * scale;
-            value0.store(d_row + n + i);
-            value1.store(d_row + n + i + Vec::size());
-            const auto gate_up = at::vec::deinterleave2(value0, value1);
-            const Vec output =
-                    gate_up.first / (Vec(1.0f) + (-gate_up.first).exp()) *
-                    gate_up.second;
-            output.store(o_row + (n + i) / 2);
-        }
-        if (i < count) {
-            const int64_t width = count - i;
-            const Vec value = Vec::loadu(values + i, width) * scale;
-            value.store(d_row + n + i, width);
-            const auto gate_up = at::vec::deinterleave2(value, Vec(0.0f));
-            const Vec output =
-                    gate_up.first / (Vec(1.0f) + (-gate_up.first).exp()) *
-                    gate_up.second;
-            output.store(o_row + (n + i) / 2, width / 2);
+        if (r_ptr == nullptr) {
+            for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
+                const Vec value0 = load_vec_as_float(values + i);
+                const Vec value1 = load_vec_as_float(values + i + Vec::size());
+                store_float_as_vec(d_row + n + i, value0);
+                store_float_as_vec(d_row + n + i + Vec::size(), value1);
+                const auto gate_up = at::vec::deinterleave2(value0, value1);
+                const Vec output =
+                        gate_up.first / (Vec(1.0f) + (-gate_up.first).exp()) *
+                        gate_up.second;
+                store_float_as_vec(o_row + (n + i) / 2, output);
+            }
+            if (i < count) {
+                const int64_t width = count - i;
+                const Vec value = load_vec_as_float(values + i, width);
+                store_float_as_vec(d_row + n + i, value, width);
+                const auto gate_up = at::vec::deinterleave2(value, Vec(0.0f));
+                const Vec output =
+                        gate_up.first / (Vec(1.0f) + (-gate_up.first).exp()) *
+                        gate_up.second;
+                store_float_as_vec(o_row + (n + i) / 2, output, width / 2);
+            }
+        } else {
+            const Vec scale(r_ptr[m]);
+            for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
+                const Vec value0 = load_vec_as_float(values + i) * scale;
+                const Vec value1 = load_vec_as_float(values + i + Vec::size()) * scale;
+                store_float_as_vec(d_row + n + i, value0);
+                store_float_as_vec(d_row + n + i + Vec::size(), value1);
+                const auto gate_up = at::vec::deinterleave2(value0, value1);
+                const Vec output =
+                        gate_up.first / (Vec(1.0f) + (-gate_up.first).exp()) *
+                        gate_up.second;
+                store_float_as_vec(o_row + (n + i) / 2, output);
+            }
+            if (i < count) {
+                const int64_t width = count - i;
+                const Vec value = load_vec_as_float(values + i, width) * scale;
+                store_float_as_vec(d_row + n + i, value, width);
+                const auto gate_up = at::vec::deinterleave2(value, Vec(0.0f));
+                const Vec output =
+                        gate_up.first / (Vec(1.0f) + (-gate_up.first).exp()) *
+                        gate_up.second;
+                store_float_as_vec(o_row + (n + i) / 2, output, width / 2);
+            }
         }
     });
 
     return {D, O};
 }
 
+template <typename T>
 std::pair<at::Tensor, at::Tensor> execute_rope(
         const at::Tensor &A,
         const at::Tensor &B,
         const at::Tensor *R,
         const at::Tensor &cos_sin,
         bool backward) {
-    require_gemm_inputs(A, B);
+    require_gemm_inputs_template<T>(A, B);
     if (R != nullptr) {
         require_vector(*R, A.size(0), "R");
     }
-    require_matrix(cos_sin, "cos_sin");
+    require_matrix_template<T>(cos_sin, "cos_sin");
     TORCH_CHECK(cos_sin.size(0) == A.size(0) && cos_sin.size(1) == B.size(1), "RoPE cos_sin shape must match accumulator shape");
     TORCH_CHECK(B.size(1) % 2 == 0, "RoPE expects an even last dimension");
 
     const int64_t M = A.size(0);
     const int64_t N = B.size(1);
-    auto D = at::empty({M, N}, A.options().dtype(at::kFloat));
-    auto O = at::empty({M, N}, A.options().dtype(at::kFloat));
+    auto D = at::empty({M, N}, A.options().dtype(A.scalar_type()));
+    auto O = at::empty({M, N}, A.options().dtype(A.scalar_type()));
     const float *r_ptr = R == nullptr ? nullptr : R->data_ptr<float>();
-    const float *cs_ptr = cos_sin.data_ptr<float>();
-    float *d_ptr = D.data_ptr<float>();
-    float *o_ptr = O.data_ptr<float>();
+    const T *cs_ptr = cos_sin.data_ptr<T>();
+    T *d_ptr = D.data_ptr<T>();
+    T *o_ptr = O.data_ptr<T>();
     const float sign = backward ? -1.0f : 1.0f;
 
-    visit_gemm_vectors(A, B, [&](int64_t m, int64_t n, int64_t count, const float *values) {
-        float *d_row = d_ptr + m * N;
-        float *o_row = o_ptr + m * N;
-        const float *cs_row = cs_ptr + m * N;
-        const Vec scale(r_ptr == nullptr ? 1.0f : r_ptr[m]);
+    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+        T *d_row = d_ptr + m * N;
+        T *o_row = o_ptr + m * N;
+        const T *cs_row = cs_ptr + m * N;
         const Vec sign_vec(sign);
         int64_t i = 0;
-        for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
-            const Vec value0 = Vec::loadu(values + i) * scale;
-            const Vec value1 = Vec::loadu(values + i + Vec::size()) * scale;
-            value0.store(d_row + n + i);
-            value1.store(d_row + n + i + Vec::size());
-            const auto x = at::vec::deinterleave2(value0, value1);
-            const auto cs = at::vec::deinterleave2(
-                    Vec::loadu(cs_row + n + i),
-                    Vec::loadu(cs_row + n + i + Vec::size()));
-            const Vec s = cs.second * sign_vec;
-            const Vec y0 = x.first * cs.first + x.second * s;
-            const Vec y1 = x.first * (-s) + x.second * cs.first;
-            const auto output = at::vec::interleave2(y0, y1);
-            output.first.store(o_row + n + i);
-            output.second.store(o_row + n + i + Vec::size());
-        }
-        if (i < count) {
-            const int64_t width = count - i;
-            const Vec value = Vec::loadu(values + i, width) * scale;
-            value.store(d_row + n + i, width);
-            const auto x = at::vec::deinterleave2(value, Vec(0.0f));
-            const auto cs = at::vec::deinterleave2(
-                    Vec::loadu(cs_row + n + i, width),
-                    Vec(0.0f));
-            const Vec s = cs.second * sign_vec;
-            const Vec y0 = x.first * cs.first + x.second * s;
-            const Vec y1 = x.first * (-s) + x.second * cs.first;
-            at::vec::interleave2(y0, y1).first.store(o_row + n + i, width);
+        if (r_ptr == nullptr) {
+            for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
+                const Vec value0 = load_vec_as_float(values + i);
+                const Vec value1 = load_vec_as_float(values + i + Vec::size());
+                store_float_as_vec(d_row + n + i, value0);
+                store_float_as_vec(d_row + n + i + Vec::size(), value1);
+                const auto x = at::vec::deinterleave2(value0, value1);
+                const auto cs = at::vec::deinterleave2(
+                        load_vec_as_float(cs_row + n + i),
+                        load_vec_as_float(cs_row + n + i + Vec::size()));
+                const Vec s = cs.second * sign_vec;
+                const Vec y0 = x.first * cs.first + x.second * s;
+                const Vec y1 = x.first * (-s) + x.second * cs.first;
+                const auto output = at::vec::interleave2(y0, y1);
+                store_float_as_vec(o_row + n + i, output.first);
+                store_float_as_vec(o_row + n + i + Vec::size(), output.second);
+            }
+            if (i < count) {
+                const int64_t width = count - i;
+                const Vec value = load_vec_as_float(values + i, width);
+                store_float_as_vec(d_row + n + i, value, width);
+                const auto x = at::vec::deinterleave2(value, Vec(0.0f));
+                const auto cs = at::vec::deinterleave2(
+                        load_vec_as_float(cs_row + n + i, width),
+                        Vec(0.0f));
+                const Vec s = cs.second * sign_vec;
+                const Vec y0 = x.first * cs.first + x.second * s;
+                const Vec y1 = x.first * (-s) + x.second * cs.first;
+                store_float_as_vec(o_row + n + i, at::vec::interleave2(y0, y1).first, width);
+            }
+        } else {
+            const Vec scale(r_ptr[m]);
+            for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
+                const Vec value0 = load_vec_as_float(values + i) * scale;
+                const Vec value1 = load_vec_as_float(values + i + Vec::size()) * scale;
+                store_float_as_vec(d_row + n + i, value0);
+                store_float_as_vec(d_row + n + i + Vec::size(), value1);
+                const auto x = at::vec::deinterleave2(value0, value1);
+                const auto cs = at::vec::deinterleave2(
+                        load_vec_as_float(cs_row + n + i),
+                        load_vec_as_float(cs_row + n + i + Vec::size()));
+                const Vec s = cs.second * sign_vec;
+                const Vec y0 = x.first * cs.first + x.second * s;
+                const Vec y1 = x.first * (-s) + x.second * cs.first;
+                const auto output = at::vec::interleave2(y0, y1);
+                store_float_as_vec(o_row + n + i, output.first);
+                store_float_as_vec(o_row + n + i + Vec::size(), output.second);
+            }
+            if (i < count) {
+                const int64_t width = count - i;
+                const Vec value = load_vec_as_float(values + i, width) * scale;
+                store_float_as_vec(d_row + n + i, value, width);
+                const auto x = at::vec::deinterleave2(value, Vec(0.0f));
+                const auto cs = at::vec::deinterleave2(
+                        load_vec_as_float(cs_row + n + i, width),
+                        Vec(0.0f));
+                const Vec s = cs.second * sign_vec;
+                const Vec y0 = x.first * cs.first + x.second * s;
+                const Vec y1 = x.first * (-s) + x.second * cs.first;
+                store_float_as_vec(o_row + n + i, at::vec::interleave2(y0, y1).first, width);
+            }
         }
     });
 
     return {D, O};
 }
 
+template <typename T>
 std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_residual_partial_rmsnorm(
         const at::Tensor &A,
         const at::Tensor &B,
         const at::Tensor &C,
         const at::Tensor &W,
         int64_t block_size) {
-    require_gemm_inputs(A, B);
-    require_matrix(C, "C");
-    require_vector(W, B.size(1), "W");
+    require_gemm_inputs_template<T>(A, B);
+    require_matrix_template<T>(C, "C");
+    require_vector_template<T>(W, B.size(1), "W");
     TORCH_CHECK(C.size(0) == A.size(0) && C.size(1) == B.size(1), "residual shape mismatch");
     TORCH_CHECK(block_size > 0, "block post-op requires a positive block_size");
     TORCH_CHECK(B.size(1) % block_size == 0, "N must be divisible by block_size");
@@ -682,43 +1378,51 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_residual_partial_rmsnorm(
     const int64_t M = A.size(0);
     const int64_t N = B.size(1);
     const int64_t num_blocks = N / block_size;
-    auto D = at::empty({M, N}, A.options().dtype(at::kFloat));
-    auto S = at::empty({M, num_blocks}, A.options().dtype(at::kFloat));
-    auto O = at::empty({M, N}, A.options().dtype(at::kFloat));
-    const float *c_base = C.data_ptr<float>();
-    const float *w_ptr = W.data_ptr<float>();
-    float *d_ptr = D.data_ptr<float>();
-    float *s_ptr = S.data_ptr<float>();
-    float *o_ptr = O.data_ptr<float>();
+    auto D = at::empty({M, N}, A.options().dtype(A.scalar_type()));
+    auto S = at::empty({M, num_blocks}, A.options().dtype(A.scalar_type()));
+    auto O = at::empty({M, N}, A.options().dtype(A.scalar_type()));
+    const T *c_base = C.data_ptr<T>();
+    const T *w_ptr = W.data_ptr<T>();
+    T *d_ptr = D.data_ptr<T>();
+    T *s_ptr = S.data_ptr<T>();
+    T *o_ptr = O.data_ptr<T>();
     S.zero_();
 
-    visit_gemm_vectors_reduction(A, B, block_size, [&](int64_t m, int64_t n, int64_t count, const float *values) {
-        float *d_row = d_ptr + m * N;
-        float *s_row = s_ptr + m * num_blocks;
-        float *o_row = o_ptr + m * N;
-        const float *c_row = c_base + m * N;
+    visit_gemm_vectors_reduction<T>(A, B, block_size, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+        T *d_row = d_ptr + m * N;
+        T *s_row = s_ptr + m * num_blocks;
+        T *o_row = o_ptr + m * N;
+        const T *c_row = c_base + m * N;
         for (int64_t i = 0; i < count; i += Vec::size()) {
             const int64_t width = std::min<int64_t>(Vec::size(), count - i);
             const int64_t col = n + i;
             const Vec value =
-                    Vec::loadu(values + i, width) + Vec::loadu(c_row + col, width);
-            value.store(d_row + col, width);
-            (value * Vec::loadu(w_ptr + col, width)).store(o_row + col, width);
+                    load_vec_as_float(values + i, width) + load_vec_as_float(c_row + col, width);
+            store_float_as_vec(d_row + col, value, width);
+            store_float_as_vec(o_row + col, value * load_vec_as_float(w_ptr + col, width), width);
             if (col / block_size == (col + width - 1) / block_size) {
                 const Vec square = value * value;
-                const float sum_sq = at::vec::vec_reduce_all<float>(
-                        [](Vec &x, Vec &y) { return x + y; },
-                        square,
-                        width);
-                s_row[col / block_size] +=
-                        sum_sq / static_cast<float>(block_size);
+                float sum_sq = 0.0f;
+                if (width == Vec::size()) {
+                    sum_sq = vec_reduce_sum(square);
+                } else {
+                    alignas(64) std::array<float, Vec::size()> scalar_values;
+                    square.store(scalar_values.data(), width);
+                    for (int64_t j = 0; j < width; ++j) {
+                        sum_sq += scalar_values[j];
+                    }
+                }
+                s_row[col / block_size] = static_cast<T>(
+                        static_cast<float>(s_row[col / block_size]) +
+                        sum_sq / static_cast<float>(block_size));
             } else {
                 alignas(64) std::array<float, Vec::size()> scalar_values;
                 value.store(scalar_values.data(), width);
                 for (int64_t j = 0; j < width; ++j) {
                     const float scalar = scalar_values[j];
-                    s_row[(col + j) / block_size] +=
-                            (scalar * scalar) / static_cast<float>(block_size);
+                    s_row[(col + j) / block_size] = static_cast<T>(
+                            static_cast<float>(s_row[(col + j) / block_size]) +
+                            (scalar * scalar) / static_cast<float>(block_size));
                 }
             }
         }
@@ -727,13 +1431,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_residual_partial_rmsnorm(
     return {D, S, O};
 }
 
+template <typename T>
 std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_partial_cross_entropy(
         const at::Tensor &A,
         const at::Tensor &B,
         const at::Tensor *R,
         const at::Tensor &targets,
         int64_t block_size) {
-    require_gemm_inputs(A, B);
+    require_gemm_inputs_template<T>(A, B);
     if (R != nullptr) {
         require_vector(*R, A.size(0), "R");
     }
@@ -745,16 +1450,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_partial_cross_entropy(
     const int64_t K = A.size(1);
     const int64_t N = B.size(1);
     const int64_t num_blocks = N / block_size;
-    auto logits = at::empty({M, N}, A.options().dtype(at::kFloat));
-    auto logits_tgt = at::empty({M}, A.options().dtype(at::kFloat));
-    auto logits_lse = at::empty({M, num_blocks}, A.options().dtype(at::kFloat));
-    const float *a_base = A.data_ptr<float>();
-    const float *b_base = B.data_ptr<float>();
+    auto logits = at::empty({M, N}, A.options().dtype(A.scalar_type()));
+    auto logits_tgt = at::empty({M}, A.options().dtype(A.scalar_type()));
+    auto logits_lse = at::empty({M, num_blocks}, A.options().dtype(A.scalar_type()));
+    const T *a_base = A.data_ptr<T>();
+    const T *b_base = B.data_ptr<T>();
     const float *r_ptr = R == nullptr ? nullptr : R->data_ptr<float>();
     const int64_t *targets_ptr = targets.data_ptr<int64_t>();
-    float *logits_ptr = logits.data_ptr<float>();
-    float *logits_tgt_ptr = logits_tgt.data_ptr<float>();
-    float *logits_lse_ptr = logits_lse.data_ptr<float>();
+    T *logits_ptr = logits.data_ptr<T>();
+    T *logits_tgt_ptr = logits_tgt.data_ptr<T>();
+    T *logits_lse_ptr = logits_lse.data_ptr<T>();
     constexpr int64_t vec_size = Vec::size();
 
     at::parallel_for(0, M, 1, [&](int64_t begin, int64_t end) {
@@ -773,24 +1478,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_partial_cross_entropy(
                     const int64_t count = std::min<int64_t>(vec_size, block_end - n);
                     Vec acc(0.0f);
                     for (int64_t k = 0; k < K; ++k) {
-                        const Vec a_vec(a_base[m * K + k]);
-                        const Vec b_vec = Vec::loadu(b_base + k * N + n, count);
+                        const Vec a_vec(static_cast<float>(a_base[m * K + k]));
+                        const Vec b_vec = load_vec_as_float<T>(b_base + k * N + n, count);
                         acc = at::vec::fmadd(a_vec, b_vec, acc);
                     }
                     acc.store(values, count);
-                    float *logits_row = logits_ptr + m * N;
+                    T *logits_row = logits_ptr + m * N;
                     for (int64_t i = 0; i < count; ++i) {
                         const int64_t col = n + i;
                         const float value = values[i] * scale;
-                        logits_row[col] = value;
+                        logits_row[col] = static_cast<T>(value);
                         if (col == target) {
-                            logits_tgt_ptr[m] = value;
+                            logits_tgt_ptr[m] = static_cast<T>(value);
                             target_seen = true;
                         }
                         update_logsumexp(value, max_value, sum_exp);
                     }
                 }
-                logits_lse_ptr[m * num_blocks + block] = max_value + std::log(sum_exp);
+                logits_lse_ptr[m * num_blocks + block] = static_cast<T>(max_value + std::log(sum_exp));
             }
             TORCH_CHECK(target_seen, "target index was not visited");
         }
@@ -842,6 +1547,76 @@ bool is_row_scale_partial_cross_entropy(const std::vector<PostOpNode> &nodes) {
             nodes[1].kind == PostOpKind::TargetLogitSelect &&
             nodes[2].kind == PostOpKind::BlockLogSumExp;
 }
+
+template <typename T>
+std::pair<at::Tensor, py::dict> execute_aten_vec_postops_template(
+        const std::vector<PostOpNode> &parsed_nodes,
+        const TensorMap &tensor_map,
+        const at::Tensor &A,
+        const at::Tensor &B) {
+    py::dict side_outputs;
+
+    if (is_residual_partial_rmsnorm(parsed_nodes)) {
+        const auto &C = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
+        const auto &W = require_tensor(tensor_map, require_name(parsed_nodes[2].tensor, "tensor"));
+        auto outputs = execute_residual_partial_rmsnorm<T>(A, B, C, W, parsed_nodes[1].block_size);
+        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = std::get<1>(outputs);
+        side_outputs[py::str(require_name(parsed_nodes[2].output, "output"))] = std::get<2>(outputs);
+        return {std::get<0>(outputs), side_outputs};
+    }
+
+    if (is_row_scale(parsed_nodes)) {
+        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
+        return {execute_row_scale<T>(A, B, R), side_outputs};
+    }
+
+    if (is_swiglu(parsed_nodes)) {
+        auto outputs = execute_swiglu<T>(A, B, nullptr);
+        side_outputs[py::str(require_name(parsed_nodes[0].output, "output"))] = outputs.second;
+        return {outputs.first, side_outputs};
+    }
+
+    if (is_row_scale_swiglu(parsed_nodes)) {
+        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
+        auto outputs = execute_swiglu<T>(A, B, &R);
+        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = outputs.second;
+        return {outputs.first, side_outputs};
+    }
+
+    if (is_rope(parsed_nodes)) {
+        const auto &cos_sin = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
+        auto outputs = execute_rope<T>(A, B, nullptr, cos_sin, parsed_nodes[0].backward);
+        side_outputs[py::str(require_name(parsed_nodes[0].output, "output"))] = outputs.second;
+        return {outputs.first, side_outputs};
+    }
+
+    if (is_row_scale_rope(parsed_nodes)) {
+        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
+        const auto &cos_sin = require_tensor(tensor_map, require_name(parsed_nodes[1].tensor, "tensor"));
+        auto outputs = execute_rope<T>(A, B, &R, cos_sin, parsed_nodes[1].backward);
+        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = outputs.second;
+        return {outputs.first, side_outputs};
+    }
+
+    if (is_partial_cross_entropy(parsed_nodes)) {
+        const auto &targets = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
+        auto outputs = execute_partial_cross_entropy<T>(A, B, nullptr, targets, parsed_nodes[1].block_size);
+        side_outputs[py::str(require_name(parsed_nodes[0].output, "output"))] = std::get<1>(outputs);
+        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = std::get<2>(outputs);
+        return {std::get<0>(outputs), side_outputs};
+    }
+
+    if (is_row_scale_partial_cross_entropy(parsed_nodes)) {
+        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
+        const auto &targets = require_tensor(tensor_map, require_name(parsed_nodes[1].tensor, "tensor"));
+        auto outputs = execute_partial_cross_entropy<T>(A, B, &R, targets, parsed_nodes[2].block_size);
+        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = std::get<1>(outputs);
+        side_outputs[py::str(require_name(parsed_nodes[2].output, "output"))] = std::get<2>(outputs);
+        return {std::get<0>(outputs), side_outputs};
+    }
+
+    throw std::invalid_argument("unsupported ATen vector post-op program");
+}
 #endif
 
 }  // namespace
@@ -888,68 +1663,14 @@ std::pair<at::Tensor, py::dict> execute_aten_vec_postops(
 #else
     const auto parsed_nodes = parse_post_ops(nodes);
     const auto tensor_map = parse_tensor_map(tensors);
-    py::dict side_outputs;
 
-    if (is_residual_partial_rmsnorm(parsed_nodes)) {
-        const auto &C = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
-        const auto &W = require_tensor(tensor_map, require_name(parsed_nodes[2].tensor, "tensor"));
-        auto outputs = execute_residual_partial_rmsnorm(A, B, C, W, parsed_nodes[1].block_size);
-        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = std::get<1>(outputs);
-        side_outputs[py::str(require_name(parsed_nodes[2].output, "output"))] = std::get<2>(outputs);
-        return {std::get<0>(outputs), side_outputs};
+    if (A.scalar_type() == at::kFloat) {
+        return execute_aten_vec_postops_template<float>(parsed_nodes, tensor_map, A, B);
+    } else if (A.scalar_type() == at::kBFloat16) {
+        return execute_aten_vec_postops_template<c10::BFloat16>(parsed_nodes, tensor_map, A, B);
+    } else {
+        TORCH_CHECK(false, "aten-vec provider only supports float32 and bfloat16 dtypes");
     }
-
-    if (is_row_scale(parsed_nodes)) {
-        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
-        return {execute_row_scale(A, B, R), side_outputs};
-    }
-
-    if (is_swiglu(parsed_nodes)) {
-        auto outputs = execute_swiglu(A, B, nullptr);
-        side_outputs[py::str(require_name(parsed_nodes[0].output, "output"))] = outputs.second;
-        return {outputs.first, side_outputs};
-    }
-
-    if (is_row_scale_swiglu(parsed_nodes)) {
-        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
-        auto outputs = execute_swiglu(A, B, &R);
-        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = outputs.second;
-        return {outputs.first, side_outputs};
-    }
-
-    if (is_rope(parsed_nodes)) {
-        const auto &cos_sin = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
-        auto outputs = execute_rope(A, B, nullptr, cos_sin, parsed_nodes[0].backward);
-        side_outputs[py::str(require_name(parsed_nodes[0].output, "output"))] = outputs.second;
-        return {outputs.first, side_outputs};
-    }
-
-    if (is_row_scale_rope(parsed_nodes)) {
-        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
-        const auto &cos_sin = require_tensor(tensor_map, require_name(parsed_nodes[1].tensor, "tensor"));
-        auto outputs = execute_rope(A, B, &R, cos_sin, parsed_nodes[1].backward);
-        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = outputs.second;
-        return {outputs.first, side_outputs};
-    }
-
-    if (is_partial_cross_entropy(parsed_nodes)) {
-        const auto &targets = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
-        auto outputs = execute_partial_cross_entropy(A, B, nullptr, targets, parsed_nodes[1].block_size);
-        side_outputs[py::str(require_name(parsed_nodes[0].output, "output"))] = std::get<1>(outputs);
-        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = std::get<2>(outputs);
-        return {std::get<0>(outputs), side_outputs};
-    }
-
-    if (is_row_scale_partial_cross_entropy(parsed_nodes)) {
-        const auto &R = require_tensor(tensor_map, require_name(parsed_nodes[0].tensor, "tensor"));
-        const auto &targets = require_tensor(tensor_map, require_name(parsed_nodes[1].tensor, "tensor"));
-        auto outputs = execute_partial_cross_entropy(A, B, &R, targets, parsed_nodes[2].block_size);
-        side_outputs[py::str(require_name(parsed_nodes[1].output, "output"))] = std::get<1>(outputs);
-        side_outputs[py::str(require_name(parsed_nodes[2].output, "output"))] = std::get<2>(outputs);
-        return {std::get<0>(outputs), side_outputs};
-    }
-
-    throw std::invalid_argument("unsupported ATen vector post-op program");
 #endif
 }
 

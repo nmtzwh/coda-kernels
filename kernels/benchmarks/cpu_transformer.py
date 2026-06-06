@@ -109,7 +109,7 @@ def _provider_env(provider: str):
 
 def _make_inputs(args: argparse.Namespace):
     torch.manual_seed(args.seed)
-    dtype = torch.float32
+    dtype = torch.float32 if getattr(args, "dtype", "float32") == "float32" else torch.bfloat16
     qkv_dim = args.qkv_dim or args.hidden_dim * 3
 
     x0 = torch.randn((args.batch_size, args.seq_len, args.hidden_dim), dtype=dtype)
@@ -142,6 +142,7 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip-compiled", action="store_true")
+    parser.add_argument("--dtype", type=str, choices=["float32", "bfloat16"], default="float32")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
