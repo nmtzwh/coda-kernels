@@ -1297,7 +1297,7 @@ void visit_gemm_vectors_blocked(
     const int64_t M = A.size(0);
     const int64_t K = A.size(1);
     const int64_t N = B.size(1);
-    const bool use_parallel = (M > 4) || (M * N * K >= 20000000);
+    const bool use_parallel = (M > 4) || (M * N * K >= 100000);
     const T *a_base = A.data_ptr<T>();
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t row_tile = 4;

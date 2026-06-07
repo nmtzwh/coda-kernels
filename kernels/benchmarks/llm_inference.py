@@ -1,15 +1,15 @@
-import argparse
 import os
+# Set thread affinity variables if not already set before importing torch
+os.environ.setdefault("OMP_PLACES", "cores")
+os.environ.setdefault("OMP_PROC_BIND", "close")
+
+import argparse
 import time
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 from models.ops import gemm_residual_rmsnorm_gemm_fwd, BlockSizeConfig2
-
-# Set thread affinity variables if not already set
-os.environ.setdefault("OMP_PLACES", "cores")
-os.environ.setdefault("OMP_PROC_BIND", "close")
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -29,8 +29,9 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
+    if cos.ndim < 4:
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -127,6 +128,10 @@ def coda_forward(
     B, T = input_ids.shape
     x = model.model.embed_tokens(input_ids) # shape (B, T, hidden_size)
     
+    # Pre-unsqueeze cos and sin once outside the layers loop
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    
     # Layer 0 Attention input
     l0_weights = fused_weights[0]
     h = model.model.layers[0].input_layernorm(x)
@@ -167,12 +172,19 @@ def coda_forward(
             k_full = k
             v_full = v
             
-        k_full = repeat_kv(k_full, num_heads // num_kv_heads)
-        v_full = repeat_kv(v_full, num_heads // num_kv_heads)
-        
-        attn_out = torch.nn.functional.scaled_dot_product_attention(
-            q, k_full, v_full, is_causal=(T > 1)
-        )
+        if num_heads != num_kv_heads:
+            # 5D broadcasting for GQA to avoid repeat_kv memory copy
+            q_5d = q.view(B, num_kv_heads, num_heads // num_kv_heads, T, head_dim)
+            k_5d = k_full.unsqueeze(2) # (B, num_kv_heads, 1, T_seq, head_dim)
+            v_5d = v_full.unsqueeze(2)
+            attn_out = torch.nn.functional.scaled_dot_product_attention(
+                q_5d, k_5d, v_5d, is_causal=(T > 1)
+            )
+            attn_out = attn_out.view(B, num_heads, T, head_dim)
+        else:
+            attn_out = torch.nn.functional.scaled_dot_product_attention(
+                q, k_full, v_full, is_causal=(T > 1)
+            )
         attn_out = attn_out.transpose(1, 2).reshape(B, T, -1).contiguous()
         
         # Fused MLP input block
@@ -330,6 +342,7 @@ def main():
     parser.add_argument("--gen-len", type=int, default=32, help="Number of tokens to generate.")
     parser.add_argument("--threads", type=int, default=8, help="Number of CPU threads.")
     parser.add_argument("--skip-compiled", action="store_true", help="Skip torch.compile benchmarking.")
+    parser.add_argument("--dtype", type=str, choices=["float32", "bfloat16"], default="bfloat16", help="Precision (float32 or bfloat16).")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
@@ -342,10 +355,11 @@ def main():
     is_qwen3 = "qwen3" in config.model_type.lower()
     print(f"Model Type: {config.model_type} (is_qwen3={is_qwen3})")
     
-    print("Loading weights in bfloat16 on CPU...")
+    dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
+    print(f"Loading weights in {args.dtype} on CPU...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
         low_cpu_mem_usage=True
     )
     model.eval()
