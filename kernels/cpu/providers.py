@@ -409,6 +409,7 @@ class AtenVecProvider(CpuGemmProvider):
 
     def __init__(self):
         super().__init__()
+        self._program_cache = {}
 
     @classmethod
     def is_available(cls, features: CpuBackendFeatures) -> bool:
@@ -495,16 +496,17 @@ class AtenVecProvider(CpuGemmProvider):
         **tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         native = load_native_extension()
-        supported = (
-            native is not None
-            and hasattr(native, "execute_aten_vec_postops")
-            and self._is_supported(
-                program,
-                A,
-                B,
-                tensors,
-            )
-        )
+        if native is None or not hasattr(native, "execute_aten_vec_postops"):
+            return super().execute(program, A, B, **tensors)
+
+        cache_entry = self._program_cache.get(program)
+        if cache_entry is None:
+            supported = self._is_supported(program, A, B, tensors)
+            native_nodes = program.to_native() if supported else None
+            cache_entry = (supported, native_nodes)
+            self._program_cache[program] = cache_entry
+
+        supported, native_nodes = cache_entry
         if not supported:
             if _env_enabled("CODA_ATEN_VEC_STRICT"):
                 raise RuntimeError(
@@ -515,7 +517,7 @@ class AtenVecProvider(CpuGemmProvider):
 
         out, side_outputs = native.execute_aten_vec_postops(
             program.name,
-            program.to_native(),
+            native_nodes,
             A,
             B,
             tensors,
@@ -635,3 +637,9 @@ def select_provider(preferred: str | None = None) -> CpuGemmProvider:
 
 def current_provider_name() -> str:
     return select_provider().name
+
+
+def prepack_weight(weight: torch.Tensor):
+    native = load_native_extension()
+    if native is not None and hasattr(native, "prepack_weight"):
+        native.prepack_weight(weight)

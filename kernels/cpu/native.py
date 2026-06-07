@@ -264,7 +264,6 @@ def _aten_vec_cflags() -> list[str]:
             "-mavx512bw",
             "-mfma",
             "-march=native",
-            "-ffast-math",
         ]
 
     if selected_isa == "avx2":
@@ -284,7 +283,6 @@ def _aten_vec_cflags() -> list[str]:
             "-mavx2",
             "-mfma",
             "-march=native",
-            "-ffast-math",
         ]
 
     if selected_isa == "sve256":

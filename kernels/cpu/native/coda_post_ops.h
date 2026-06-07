@@ -54,6 +54,7 @@ bool has_onednn();
 bool has_libxsmm();
 bool has_aten_vec();
 std::string aten_vec_isa();
+void prepack_weight(const at::Tensor &B);
 
 std::pair<at::Tensor, pybind11::dict> execute_brgemm_postops(
         const std::string &program_name,

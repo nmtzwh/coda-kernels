@@ -32,7 +32,7 @@ using Vec = at::vec::Vectorized<float>;
 #if !defined(CODA_CPU_ATEN_VEC_L2_BYTES)
 #define CODA_CPU_ATEN_VEC_L2_BYTES 524288
 #endif
-constexpr int64_t kMaxMcRows = 64;
+constexpr int64_t kMaxMcRows = 128;
 constexpr int64_t kMaxBlockN = 3 * Vec::size();
 constexpr int64_t kMaxAccBufferSize = kMaxMcRows * kMaxBlockN;
 constexpr int64_t kL1Budget = CODA_CPU_ATEN_VEC_L1_BYTES * 4 / 5;
@@ -345,7 +345,7 @@ at::Tensor pack_b_register_blocks(const at::Tensor &B) {
 
     {
         std::lock_guard<std::mutex> lock(packed_b_cache_mutex);
-        if (packed_b_cache.size() >= 16) {
+        if (packed_b_cache.size() >= 1024) {
             packed_b_cache.clear();
         }
         packed_b_cache.emplace(key, PackedBEntry{B, packed});
@@ -362,10 +362,10 @@ inline void static_for(const Fn &fn) {
     }
 }
 
-template <typename T, bool accumulate>
-inline Vec load_accumulator(const T *ptr, int64_t count = Vec::size()) {
+template <bool accumulate>
+inline Vec load_accumulator(const float *ptr, int64_t count = Vec::size()) {
     if constexpr (accumulate) {
-        return load_vec_as_float<T>(ptr, count);
+        return Vec::loadu(ptr, count);
     } else {
         return Vec(0.0f);
     }
@@ -375,20 +375,20 @@ template <typename T, bool accumulate>
 inline void gemm_microkernel_4x2(
         const T *a_base,
         const typename PackedBType<T>::type *b_panel,
-        T *acc_base,
+        float *acc_base,
         int64_t K,
         int64_t k_begin,
         int64_t k_end) {
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t block_n = 2 * vec_size;
-    Vec c00 = load_accumulator<T, accumulate>(acc_base);
-    Vec c01 = load_accumulator<T, accumulate>(acc_base + vec_size);
-    Vec c10 = load_accumulator<T, accumulate>(acc_base + block_n);
-    Vec c11 = load_accumulator<T, accumulate>(acc_base + block_n + vec_size);
-    Vec c20 = load_accumulator<T, accumulate>(acc_base + 2 * block_n);
-    Vec c21 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + vec_size);
-    Vec c30 = load_accumulator<T, accumulate>(acc_base + 3 * block_n);
-    Vec c31 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + vec_size);
+    Vec c00 = load_accumulator<accumulate>(acc_base);
+    Vec c01 = load_accumulator<accumulate>(acc_base + vec_size);
+    Vec c10 = load_accumulator<accumulate>(acc_base + block_n);
+    Vec c11 = load_accumulator<accumulate>(acc_base + block_n + vec_size);
+    Vec c20 = load_accumulator<accumulate>(acc_base + 2 * block_n);
+    Vec c21 = load_accumulator<accumulate>(acc_base + 2 * block_n + vec_size);
+    Vec c30 = load_accumulator<accumulate>(acc_base + 3 * block_n);
+    Vec c31 = load_accumulator<accumulate>(acc_base + 3 * block_n + vec_size);
 
     using PackedT = typename PackedBType<T>::type;
     if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
@@ -405,23 +405,84 @@ inline void gemm_microkernel_4x2(
         __m512 c30_v = c30.values;
         __m512 c31_v = c31.values;
 
-        for (int64_t p = p_begin; p < p_end; ++p) {
-            __m512 b0 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n));
-            __m512 b1 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 2));
+        const PackedT *b_ptr = b_panel + p_begin * 2 * block_n;
+        const T *a0_ptr = a_base + 2 * p_begin;
+        const T *a1_ptr = a0_ptr + K;
+        const T *a2_ptr = a0_ptr + 2 * K;
+        const T *a3_ptr = a0_ptr + 3 * K;
+        typedef int32_t __attribute__((__may_alias__)) aliased_int32_t;
 
-            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 0, p, K)));
-            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, K, p, K)));
-            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 2 * K, p, K)));
-            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 3 * K, p, K)));
+        int64_t p = p_begin;
+        for (; p + 1 < p_end; p += 2) {
+            __m512 b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr));
+            __m512 b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 2));
 
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr)));
             c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
             c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr)));
             c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
             c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr)));
             c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
             c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr)));
             c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
             c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+
+            b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n));
+            b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n + vec_size * 2));
+
+            a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr + 2)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+
+            a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr + 2)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+
+            a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr + 2)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+
+            a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr + 2)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+
+            b_ptr += 4 * block_n;
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+        }
+        for (; p < p_end; ++p) {
+            __m512 b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr));
+            __m512 b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 2));
+
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+
+            b_ptr += 2 * block_n;
+            a0_ptr += 2;
+            a1_ptr += 2;
+            a2_ptr += 2;
+            a3_ptr += 2;
         }
 
         c00 = Vec(c00_v);
@@ -489,38 +550,38 @@ inline void gemm_microkernel_4x2(
         }
     }
 
-    store_float_as_vec<T>(acc_base, c00);
-    store_float_as_vec<T>(acc_base + vec_size, c01);
-    store_float_as_vec<T>(acc_base + block_n, c10);
-    store_float_as_vec<T>(acc_base + block_n + vec_size, c11);
-    store_float_as_vec<T>(acc_base + 2 * block_n, c20);
-    store_float_as_vec<T>(acc_base + 2 * block_n + vec_size, c21);
-    store_float_as_vec<T>(acc_base + 3 * block_n, c30);
-    store_float_as_vec<T>(acc_base + 3 * block_n + vec_size, c31);
+    c00.store(acc_base);
+    c01.store(acc_base + vec_size);
+    c10.store(acc_base + block_n);
+    c11.store(acc_base + block_n + vec_size);
+    c20.store(acc_base + 2 * block_n);
+    c21.store(acc_base + 2 * block_n + vec_size);
+    c30.store(acc_base + 3 * block_n);
+    c31.store(acc_base + 3 * block_n + vec_size);
 }
 
 template <typename T, bool accumulate>
 inline void gemm_microkernel_4x3(
         const T *a_base,
         const typename PackedBType<T>::type *b_panel,
-        T *acc_base,
+        float *acc_base,
         int64_t K,
         int64_t k_begin,
         int64_t k_end) {
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t block_n = 3 * vec_size;
-    Vec c00 = load_accumulator<T, accumulate>(acc_base);
-    Vec c01 = load_accumulator<T, accumulate>(acc_base + vec_size);
-    Vec c02 = load_accumulator<T, accumulate>(acc_base + 2 * vec_size);
-    Vec c10 = load_accumulator<T, accumulate>(acc_base + block_n);
-    Vec c11 = load_accumulator<T, accumulate>(acc_base + block_n + vec_size);
-    Vec c12 = load_accumulator<T, accumulate>(acc_base + block_n + 2 * vec_size);
-    Vec c20 = load_accumulator<T, accumulate>(acc_base + 2 * block_n);
-    Vec c21 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + vec_size);
-    Vec c22 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + 2 * vec_size);
-    Vec c30 = load_accumulator<T, accumulate>(acc_base + 3 * block_n);
-    Vec c31 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + vec_size);
-    Vec c32 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + 2 * vec_size);
+    Vec c00 = load_accumulator<accumulate>(acc_base);
+    Vec c01 = load_accumulator<accumulate>(acc_base + vec_size);
+    Vec c02 = load_accumulator<accumulate>(acc_base + 2 * vec_size);
+    Vec c10 = load_accumulator<accumulate>(acc_base + block_n);
+    Vec c11 = load_accumulator<accumulate>(acc_base + block_n + vec_size);
+    Vec c12 = load_accumulator<accumulate>(acc_base + block_n + 2 * vec_size);
+    Vec c20 = load_accumulator<accumulate>(acc_base + 2 * block_n);
+    Vec c21 = load_accumulator<accumulate>(acc_base + 2 * block_n + vec_size);
+    Vec c22 = load_accumulator<accumulate>(acc_base + 2 * block_n + 2 * vec_size);
+    Vec c30 = load_accumulator<accumulate>(acc_base + 3 * block_n);
+    Vec c31 = load_accumulator<accumulate>(acc_base + 3 * block_n + vec_size);
+    Vec c32 = load_accumulator<accumulate>(acc_base + 3 * block_n + 2 * vec_size);
 
     using PackedT = typename PackedBType<T>::type;
     if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
@@ -541,28 +602,99 @@ inline void gemm_microkernel_4x3(
         __m512 c31_v = c31.values;
         __m512 c32_v = c32.values;
 
-        for (int64_t p = p_begin; p < p_end; ++p) {
-            __m512 b0 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n));
-            __m512 b1 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 2));
-            __m512 b2 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 4));
+        const PackedT *b_ptr = b_panel + p_begin * 2 * block_n;
+        const T *a0_ptr = a_base + 2 * p_begin;
+        const T *a1_ptr = a0_ptr + K;
+        const T *a2_ptr = a0_ptr + 2 * K;
+        const T *a3_ptr = a0_ptr + 3 * K;
+        typedef int32_t __attribute__((__may_alias__)) aliased_int32_t;
 
-            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 0, p, K)));
-            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, K, p, K)));
-            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 2 * K, p, K)));
-            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 3 * K, p, K)));
+        int64_t p = p_begin;
+        for (; p + 1 < p_end; p += 2) {
+            __m512 b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr));
+            __m512 b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 2));
+            __m512 b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 4));
 
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr)));
             c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
             c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
             c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr)));
             c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
             c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
             c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr)));
             c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
             c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
             c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr)));
             c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
             c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
             c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+
+            b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n));
+            b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n + vec_size * 2));
+            b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n + vec_size * 4));
+
+            a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr + 2)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+
+            a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr + 2)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+
+            a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr + 2)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+
+            a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr + 2)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+
+            b_ptr += 4 * block_n;
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+        }
+        for (; p < p_end; ++p) {
+            __m512 b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr));
+            __m512 b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 2));
+            __m512 b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 4));
+
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+
+            b_ptr += 2 * block_n;
+            a0_ptr += 2;
+            a1_ptr += 2;
+            a2_ptr += 2;
+            a3_ptr += 2;
         }
 
         c00 = Vec(c00_v);
@@ -649,53 +781,52 @@ inline void gemm_microkernel_4x3(
         }
     }
 
-    store_float_as_vec<T>(acc_base, c00);
-    store_float_as_vec<T>(acc_base + vec_size, c01);
-    store_float_as_vec<T>(acc_base + 2 * vec_size, c02);
-    store_float_as_vec<T>(acc_base + block_n, c10);
-    store_float_as_vec<T>(acc_base + block_n + vec_size, c11);
-    store_float_as_vec<T>(acc_base + block_n + 2 * vec_size, c12);
-    store_float_as_vec<T>(acc_base + 2 * block_n, c20);
-    store_float_as_vec<T>(acc_base + 2 * block_n + vec_size, c21);
-    store_float_as_vec<T>(acc_base + 2 * block_n + 2 * vec_size, c22);
-    store_float_as_vec<T>(acc_base + 3 * block_n, c30);
-    store_float_as_vec<T>(acc_base + 3 * block_n + vec_size, c31);
-    store_float_as_vec<T>(acc_base + 3 * block_n + 2 * vec_size, c32);
+    c00.store(acc_base);
+    c01.store(acc_base + vec_size);
+    c02.store(acc_base + 2 * vec_size);
+    c10.store(acc_base + block_n);
+    c11.store(acc_base + block_n + vec_size);
+    c12.store(acc_base + block_n + 2 * vec_size);
+    c20.store(acc_base + 2 * block_n);
+    c21.store(acc_base + 2 * block_n + vec_size);
+    c22.store(acc_base + 2 * block_n + 2 * vec_size);
+    c30.store(acc_base + 3 * block_n);
+    c31.store(acc_base + 3 * block_n + vec_size);
+    c32.store(acc_base + 3 * block_n + 2 * vec_size);
 }
 
 template <typename T, bool accumulate>
 inline void gemm_microkernel_4x4(
         const T *a_base,
         const typename PackedBType<T>::type *b_panel,
-        T *acc_base,
+        float *acc_base,
         int64_t K,
         int64_t k_begin,
         int64_t k_end) {
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t block_n = 4 * vec_size;
-    Vec c00 = load_accumulator<T, accumulate>(acc_base);
-    Vec c01 = load_accumulator<T, accumulate>(acc_base + vec_size);
-    Vec c02 = load_accumulator<T, accumulate>(acc_base + 2 * vec_size);
-    Vec c03 = load_accumulator<T, accumulate>(acc_base + 3 * vec_size);
-    Vec c10 = load_accumulator<T, accumulate>(acc_base + block_n);
-    Vec c11 = load_accumulator<T, accumulate>(acc_base + block_n + vec_size);
-    Vec c12 = load_accumulator<T, accumulate>(acc_base + block_n + 2 * vec_size);
-    Vec c13 = load_accumulator<T, accumulate>(acc_base + block_n + 3 * vec_size);
-    Vec c20 = load_accumulator<T, accumulate>(acc_base + 2 * block_n);
-    Vec c21 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + vec_size);
-    Vec c22 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + 2 * vec_size);
-    Vec c23 = load_accumulator<T, accumulate>(acc_base + 2 * block_n + 3 * vec_size);
-    Vec c30 = load_accumulator<T, accumulate>(acc_base + 3 * block_n);
-    Vec c31 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + vec_size);
-    Vec c32 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + 2 * vec_size);
-    Vec c33 = load_accumulator<T, accumulate>(acc_base + 3 * block_n + 3 * vec_size);
+    Vec c00 = load_accumulator<accumulate>(acc_base);
+    Vec c01 = load_accumulator<accumulate>(acc_base + vec_size);
+    Vec c02 = load_accumulator<accumulate>(acc_base + 2 * vec_size);
+    Vec c03 = load_accumulator<accumulate>(acc_base + 3 * vec_size);
+    Vec c10 = load_accumulator<accumulate>(acc_base + block_n);
+    Vec c11 = load_accumulator<accumulate>(acc_base + block_n + vec_size);
+    Vec c12 = load_accumulator<accumulate>(acc_base + block_n + 2 * vec_size);
+    Vec c13 = load_accumulator<accumulate>(acc_base + block_n + 3 * vec_size);
+    Vec c20 = load_accumulator<accumulate>(acc_base + 2 * block_n);
+    Vec c21 = load_accumulator<accumulate>(acc_base + 2 * block_n + vec_size);
+    Vec c22 = load_accumulator<accumulate>(acc_base + 2 * block_n + 2 * vec_size);
+    Vec c23 = load_accumulator<accumulate>(acc_base + 2 * block_n + 3 * vec_size);
+    Vec c30 = load_accumulator<accumulate>(acc_base + 3 * block_n);
+    Vec c31 = load_accumulator<accumulate>(acc_base + 3 * block_n + vec_size);
+    Vec c32 = load_accumulator<accumulate>(acc_base + 3 * block_n + 2 * vec_size);
+    Vec c33 = load_accumulator<accumulate>(acc_base + 3 * block_n + 3 * vec_size);
 
     using PackedT = typename PackedBType<T>::type;
     if constexpr (std::is_same_v<PackedT, c10::BFloat16>) {
 #if defined(__AVX512BF16__)
         const int64_t p_begin = k_begin / 2;
         const int64_t p_end = (k_end + 1) / 2;
-        const int64_t p_end_fast = (k_end < K) ? p_end : (K / 2);
 
         __m512 c00_v = c00.values;
         __m512 c01_v = c01.values;
@@ -714,36 +845,172 @@ inline void gemm_microkernel_4x4(
         __m512 c32_v = c32.values;
         __m512 c33_v = c33.values;
 
-        for (int64_t p = p_begin; p < p_end; ++p) {
-            __m512 b0 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n));
-            __m512 b1 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 2));
-            __m512 b2 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 4));
-            __m512 b3 = _mm512_loadu_ps(reinterpret_cast<const float*>(b_panel + p * 2 * block_n + vec_size * 6));
+        const PackedT *b_ptr = b_panel + p_begin * 2 * block_n;
+        const T *a0_ptr = a_base + 2 * p_begin;
+        const T *a1_ptr = a0_ptr + K;
+        const T *a2_ptr = a0_ptr + 2 * K;
+        const T *a3_ptr = a0_ptr + 3 * K;
+        typedef int32_t __attribute__((__may_alias__)) aliased_int32_t;
 
-            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 0, p, K)));
-            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, K, p, K)));
-            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 2 * K, p, K)));
-            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, 3 * K, p, K)));
+        int64_t p = p_begin;
+        for (; p + 3 < p_end; p += 4) {
+            __m512 b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr));
+            __m512 b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 2));
+            __m512 b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 4));
+            __m512 b3 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 6));
 
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr)));
             c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
             c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
             c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
             c03_v = _mm512_dpbf16_ps(c03_v, (__m512bh)a0, (__m512bh)b3);
 
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr)));
             c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
             c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
             c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
             c13_v = _mm512_dpbf16_ps(c13_v, (__m512bh)a1, (__m512bh)b3);
 
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr)));
             c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
             c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
             c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
             c23_v = _mm512_dpbf16_ps(c23_v, (__m512bh)a2, (__m512bh)b3);
 
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr)));
             c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
             c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
             c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
             c33_v = _mm512_dpbf16_ps(c33_v, (__m512bh)a3, (__m512bh)b3);
+
+            b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n));
+            b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n + vec_size * 2));
+            b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n + vec_size * 4));
+            b3 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 2 * block_n + vec_size * 6));
+
+            a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr + 2)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+            c03_v = _mm512_dpbf16_ps(c03_v, (__m512bh)a0, (__m512bh)b3);
+
+            a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr + 2)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+            c13_v = _mm512_dpbf16_ps(c13_v, (__m512bh)a1, (__m512bh)b3);
+
+            a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr + 2)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+            c23_v = _mm512_dpbf16_ps(c23_v, (__m512bh)a2, (__m512bh)b3);
+
+            a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr + 2)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+            c33_v = _mm512_dpbf16_ps(c33_v, (__m512bh)a3, (__m512bh)b3);
+
+            b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 4 * block_n));
+            b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 4 * block_n + vec_size * 2));
+            b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 4 * block_n + vec_size * 4));
+            b3 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 4 * block_n + vec_size * 6));
+
+            a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr + 4)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+            c03_v = _mm512_dpbf16_ps(c03_v, (__m512bh)a0, (__m512bh)b3);
+
+            a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr + 4)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+            c13_v = _mm512_dpbf16_ps(c13_v, (__m512bh)a1, (__m512bh)b3);
+
+            a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr + 4)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+            c23_v = _mm512_dpbf16_ps(c23_v, (__m512bh)a2, (__m512bh)b3);
+
+            a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr + 4)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+            c33_v = _mm512_dpbf16_ps(c33_v, (__m512bh)a3, (__m512bh)b3);
+
+            b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 6 * block_n));
+            b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 6 * block_n + vec_size * 2));
+            b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 6 * block_n + vec_size * 4));
+            b3 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + 6 * block_n + vec_size * 6));
+
+            a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr + 6)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+            c03_v = _mm512_dpbf16_ps(c03_v, (__m512bh)a0, (__m512bh)b3);
+
+            a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr + 6)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+            c13_v = _mm512_dpbf16_ps(c13_v, (__m512bh)a1, (__m512bh)b3);
+
+            a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr + 6)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+            c23_v = _mm512_dpbf16_ps(c23_v, (__m512bh)a2, (__m512bh)b3);
+
+            a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr + 6)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+            c33_v = _mm512_dpbf16_ps(c33_v, (__m512bh)a3, (__m512bh)b3);
+
+            b_ptr += 8 * block_n;
+            a0_ptr += 8;
+            a1_ptr += 8;
+            a2_ptr += 8;
+            a3_ptr += 8;
+        }
+        for (; p < p_end; ++p) {
+            __m512 b0 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr));
+            __m512 b1 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 2));
+            __m512 b2 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 4));
+            __m512 b3 = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + vec_size * 6));
+
+            __m512 a0 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a0_ptr)));
+            c00_v = _mm512_dpbf16_ps(c00_v, (__m512bh)a0, (__m512bh)b0);
+            c01_v = _mm512_dpbf16_ps(c01_v, (__m512bh)a0, (__m512bh)b1);
+            c02_v = _mm512_dpbf16_ps(c02_v, (__m512bh)a0, (__m512bh)b2);
+            c03_v = _mm512_dpbf16_ps(c03_v, (__m512bh)a0, (__m512bh)b3);
+
+            __m512 a1 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a1_ptr)));
+            c10_v = _mm512_dpbf16_ps(c10_v, (__m512bh)a1, (__m512bh)b0);
+            c11_v = _mm512_dpbf16_ps(c11_v, (__m512bh)a1, (__m512bh)b1);
+            c12_v = _mm512_dpbf16_ps(c12_v, (__m512bh)a1, (__m512bh)b2);
+            c13_v = _mm512_dpbf16_ps(c13_v, (__m512bh)a1, (__m512bh)b3);
+
+            __m512 a2 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a2_ptr)));
+            c20_v = _mm512_dpbf16_ps(c20_v, (__m512bh)a2, (__m512bh)b0);
+            c21_v = _mm512_dpbf16_ps(c21_v, (__m512bh)a2, (__m512bh)b1);
+            c22_v = _mm512_dpbf16_ps(c22_v, (__m512bh)a2, (__m512bh)b2);
+            c23_v = _mm512_dpbf16_ps(c23_v, (__m512bh)a2, (__m512bh)b3);
+
+            __m512 a3 = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a3_ptr)));
+            c30_v = _mm512_dpbf16_ps(c30_v, (__m512bh)a3, (__m512bh)b0);
+            c31_v = _mm512_dpbf16_ps(c31_v, (__m512bh)a3, (__m512bh)b1);
+            c32_v = _mm512_dpbf16_ps(c32_v, (__m512bh)a3, (__m512bh)b2);
+            c33_v = _mm512_dpbf16_ps(c33_v, (__m512bh)a3, (__m512bh)b3);
+
+            b_ptr += 2 * block_n;
+            a0_ptr += 2;
+            a1_ptr += 2;
+            a2_ptr += 2;
+            a3_ptr += 2;
         }
 
         c00 = Vec(c00_v);
@@ -849,29 +1116,29 @@ inline void gemm_microkernel_4x4(
         }
     }
 
-    store_float_as_vec<T>(acc_base, c00);
-    store_float_as_vec<T>(acc_base + vec_size, c01);
-    store_float_as_vec<T>(acc_base + 2 * vec_size, c02);
-    store_float_as_vec<T>(acc_base + 3 * vec_size, c03);
-    store_float_as_vec<T>(acc_base + block_n, c10);
-    store_float_as_vec<T>(acc_base + block_n + vec_size, c11);
-    store_float_as_vec<T>(acc_base + block_n + 2 * vec_size, c12);
-    store_float_as_vec<T>(acc_base + block_n + 3 * vec_size, c13);
-    store_float_as_vec<T>(acc_base + 2 * block_n, c20);
-    store_float_as_vec<T>(acc_base + 2 * block_n + vec_size, c21);
-    store_float_as_vec<T>(acc_base + 2 * block_n + 2 * vec_size, c22);
-    store_float_as_vec<T>(acc_base + 2 * block_n + 3 * vec_size, c23);
-    store_float_as_vec<T>(acc_base + 3 * block_n, c30);
-    store_float_as_vec<T>(acc_base + 3 * block_n + vec_size, c31);
-    store_float_as_vec<T>(acc_base + 3 * block_n + 2 * vec_size, c32);
-    store_float_as_vec<T>(acc_base + 3 * block_n + 3 * vec_size, c33);
+    c00.store(acc_base);
+    c01.store(acc_base + vec_size);
+    c02.store(acc_base + 2 * vec_size);
+    c03.store(acc_base + 3 * vec_size);
+    c10.store(acc_base + block_n);
+    c11.store(acc_base + block_n + vec_size);
+    c12.store(acc_base + block_n + 2 * vec_size);
+    c13.store(acc_base + block_n + 3 * vec_size);
+    c20.store(acc_base + 2 * block_n);
+    c21.store(acc_base + 2 * block_n + vec_size);
+    c22.store(acc_base + 2 * block_n + 2 * vec_size);
+    c23.store(acc_base + 2 * block_n + 3 * vec_size);
+    c30.store(acc_base + 3 * block_n);
+    c31.store(acc_base + 3 * block_n + vec_size);
+    c32.store(acc_base + 3 * block_n + 2 * vec_size);
+    c33.store(acc_base + 3 * block_n + 3 * vec_size);
 }
 
 template <typename T, int64_t rows, int64_t col_vectors, bool accumulate>
 inline void gemm_microkernel(
         const T *a_base,
         const typename PackedBType<T>::type *b_panel,
-        T *acc_base,
+        float *acc_base,
         int64_t K,
         int64_t block_n,
         int64_t k_begin,
@@ -885,7 +1152,7 @@ inline void gemm_microkernel(
     static_for<0, num_acc>([&](auto index) {
         constexpr int64_t row = index / col_vectors;
         constexpr int64_t col = index % col_vectors;
-        acc[index] = load_accumulator<T, accumulate>(acc_base + row * block_n + col * vec_size);
+        acc[index] = load_accumulator<accumulate>(acc_base + row * block_n + col * vec_size);
     });
 
     using PackedT = typename PackedBType<T>::type;
@@ -900,18 +1167,29 @@ inline void gemm_microkernel(
         });
 
         std::array<__m512, col_vectors> b_v;
+        const PackedT *b_ptr = b_panel + p_begin * 2 * block_n;
+        std::array<const T*, rows> a_ptrs;
+        static_for<0, rows>([&](auto row) {
+            a_ptrs[row] = a_base + row * K + 2 * p_begin;
+        });
+        typedef int32_t __attribute__((__may_alias__)) aliased_int32_t;
+
         for (int64_t p = p_begin; p < p_end; ++p) {
             static_for<0, col_vectors>([&](auto col) {
-                b_v[col] = _mm512_loadu_ps(reinterpret_cast<const float*>(
-                        b_panel + p * 2 * block_n + col * vec_size * 2));
+                b_v[col] = _mm512_load_ps(reinterpret_cast<const float*>(b_ptr + col * vec_size * 2));
             });
 
             static_for<0, rows>([&](auto row) {
-                __m512 a_v = _mm512_castsi512_ps(_mm512_set1_epi32(load_a_pair(a_base, row * K, p, K)));
+                __m512 a_v = _mm512_castsi512_ps(_mm512_set1_epi32(*reinterpret_cast<const aliased_int32_t*>(a_ptrs[row])));
                 static_for<0, col_vectors>([&](auto col) {
                     constexpr int64_t index = row * col_vectors + col;
                     acc_v[index] = _mm512_dpbf16_ps(acc_v[index], (__m512bh)a_v, (__m512bh)b_v[col]);
                 });
+            });
+
+            b_ptr += 2 * block_n;
+            static_for<0, rows>([&](auto row) {
+                a_ptrs[row] += 2;
             });
         }
 
@@ -940,7 +1218,7 @@ inline void gemm_microkernel(
     static_for<0, num_acc>([&](auto index) {
         constexpr int64_t row = index / col_vectors;
         constexpr int64_t col = index % col_vectors;
-        store_float_as_vec<T>(acc_base + row * block_n + col * vec_size, acc[index]);
+        acc[index].store(acc_base + row * block_n + col * vec_size);
     });
 }
 
@@ -950,7 +1228,7 @@ inline void gemm_microkernel_rows(
         bool accumulate,
         const T *a_base,
         const typename PackedBType<T>::type *b_panel,
-        T *acc_base,
+        float *acc_base,
         int64_t K,
         int64_t block_n,
         int64_t k_begin,
@@ -1019,6 +1297,7 @@ void visit_gemm_vectors_blocked(
     const int64_t M = A.size(0);
     const int64_t K = A.size(1);
     const int64_t N = B.size(1);
+    const bool use_parallel = (M > 4) || (M * N * K >= 20000000);
     const T *a_base = A.data_ptr<T>();
     constexpr int64_t vec_size = Vec::size();
     constexpr int64_t row_tile = 4;
@@ -1037,7 +1316,7 @@ void visit_gemm_vectors_blocked(
                             row_tile));
     using PackedT = typename PackedBType<T>::type;
     const int64_t raw_kc = kL1Budget / (block_n * static_cast<int64_t>(sizeof(PackedT)));
-    const int64_t kc = std::min<int64_t>(
+    const int64_t kc = !use_parallel ? K : std::min<int64_t>(
             K,
             std::max<int64_t>(64, (raw_kc / 64) * 64));
     const auto packed_B = pack_b_register_blocks<T, col_vectors>(B);
@@ -1046,10 +1325,49 @@ void visit_gemm_vectors_blocked(
     const int64_t K_padded = std::is_same_v<PackedT, c10::BFloat16> ? (ceil_div(K, 2) * 2) : K;
     const int64_t b_panel_stride = K_padded * block_n;
 
-    if (num_groups > 1) {
-        at::parallel_for(0, num_groups, 1, [&](int64_t begin, int64_t end) {
-            alignas(64) std::array<T, kMaxMcRows * col_vectors * vec_size> acc_buffer;
-            for (int64_t g_idx = begin; g_idx < end; ++g_idx) {
+    if (!use_parallel) {
+        alignas(64) std::array<float, kMaxMcRows * col_vectors * vec_size> acc_buffer;
+        for (int64_t m0 = 0; m0 < M; m0 += mc_rows) {
+            const int64_t rows = std::min<int64_t>(mc_rows, M - m0);
+            for (int64_t nb = 0; nb < num_blocks; ++nb) {
+                const PackedT *b_panel = packed_base + nb * b_panel_stride;
+                for (int64_t k0 = 0; k0 < K; k0 += kc) {
+                    const int64_t k_end = std::min<int64_t>(K, k0 + kc);
+                    for (int64_t r0 = 0; r0 < rows; r0 += row_tile) {
+                        const int64_t micro_rows = std::min<int64_t>(row_tile, rows - r0);
+                        gemm_microkernel_rows<T, col_vectors>(
+                                micro_rows,
+                                k0 != 0,
+                                a_base + (m0 + r0) * K,
+                                b_panel,
+                                acc_buffer.data() + r0 * block_n,
+                                K,
+                                block_n,
+                                k0,
+                                k_end);
+                    }
+                }
+                for (int64_t r = 0; r < rows; ++r) {
+                    const int64_t n = nb * block_n;
+                    const int64_t count = std::max<int64_t>(
+                            0,
+                            std::min<int64_t>(block_n, N - n));
+                    if (count > 0) {
+                        visitor(
+                                m0 + r,
+                                n,
+                                count,
+                                acc_buffer.data() + r * block_n);
+                    }
+                }
+            }
+        }
+    } else if (num_groups > 1) {
+        #pragma omp parallel
+        {
+            alignas(64) std::array<float, kMaxMcRows * col_vectors * vec_size> acc_buffer;
+            #pragma omp for schedule(static)
+            for (int64_t g_idx = 0; g_idx < num_groups; ++g_idx) {
                 const int64_t block_begin = g_idx * group_blocks;
                 const int64_t block_end = std::min<int64_t>(num_blocks, block_begin + group_blocks);
                 for (int64_t nb = block_begin; nb < block_end; ++nb) {
@@ -1088,7 +1406,7 @@ void visit_gemm_vectors_blocked(
                     }
                 }
             }
-        });
+        }
     } else {
         const int64_t dynamic_mc_rows = std::max<int64_t>(
                 row_tile,
@@ -1096,9 +1414,11 @@ void visit_gemm_vectors_blocked(
                         mc_rows,
                         (ceil_div(M, at::get_num_threads()) / row_tile) * row_tile));
         const int64_t m_blocks = ceil_div(M, dynamic_mc_rows);
-        at::parallel_for(0, m_blocks, 1, [&](int64_t begin, int64_t end) {
-            alignas(64) std::array<T, kMaxMcRows * col_vectors * vec_size> acc_buffer;
-            for (int64_t m_idx = begin; m_idx < end; ++m_idx) {
+        #pragma omp parallel
+        {
+            alignas(64) std::array<float, kMaxMcRows * col_vectors * vec_size> acc_buffer;
+            #pragma omp for schedule(static)
+            for (int64_t m_idx = 0; m_idx < m_blocks; ++m_idx) {
                 const int64_t m0 = m_idx * dynamic_mc_rows;
                 const int64_t rows = std::min<int64_t>(dynamic_mc_rows, M - m0);
                 for (int64_t nb = 0; nb < num_blocks; ++nb) {
@@ -1134,7 +1454,7 @@ void visit_gemm_vectors_blocked(
                     }
                 }
             }
-        });
+        }
     }
 }
 
@@ -1176,12 +1496,12 @@ at::Tensor execute_row_scale(
     const float *r_ptr = R.data_ptr<float>();
     T *d_ptr = D.data_ptr<T>();
 
-    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const float *values) {
         T *d_row = d_ptr + m * N;
         const Vec scale(r_ptr[m]);
         for (int64_t i = 0; i < count; i += Vec::size()) {
             const int64_t width = std::min<int64_t>(Vec::size(), count - i);
-            const Vec value = load_vec_as_float(values + i, width) * scale;
+            const Vec value = Vec::loadu(values + i, width) * scale;
             store_float_as_vec(d_row + n + i, value, width);
         }
     });
@@ -1208,14 +1528,14 @@ std::pair<at::Tensor, at::Tensor> execute_swiglu(
     T *d_ptr = D.data_ptr<T>();
     T *o_ptr = O.data_ptr<T>();
 
-    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const float *values) {
         T *d_row = d_ptr + m * N;
         T *o_row = o_ptr + m * (N / 2);
         int64_t i = 0;
         if (r_ptr == nullptr) {
             for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
-                const Vec value0 = load_vec_as_float(values + i);
-                const Vec value1 = load_vec_as_float(values + i + Vec::size());
+                const Vec value0 = Vec::loadu(values + i);
+                const Vec value1 = Vec::loadu(values + i + Vec::size());
                 store_float_as_vec(d_row + n + i, value0);
                 store_float_as_vec(d_row + n + i + Vec::size(), value1);
                 const auto gate_up = at::vec::deinterleave2(value0, value1);
@@ -1226,7 +1546,7 @@ std::pair<at::Tensor, at::Tensor> execute_swiglu(
             }
             if (i < count) {
                 const int64_t width = count - i;
-                const Vec value = load_vec_as_float(values + i, width);
+                const Vec value = Vec::loadu(values + i, width);
                 store_float_as_vec(d_row + n + i, value, width);
                 const auto gate_up = at::vec::deinterleave2(value, Vec(0.0f));
                 const Vec output =
@@ -1237,8 +1557,8 @@ std::pair<at::Tensor, at::Tensor> execute_swiglu(
         } else {
             const Vec scale(r_ptr[m]);
             for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
-                const Vec value0 = load_vec_as_float(values + i) * scale;
-                const Vec value1 = load_vec_as_float(values + i + Vec::size()) * scale;
+                const Vec value0 = Vec::loadu(values + i) * scale;
+                const Vec value1 = Vec::loadu(values + i + Vec::size()) * scale;
                 store_float_as_vec(d_row + n + i, value0);
                 store_float_as_vec(d_row + n + i + Vec::size(), value1);
                 const auto gate_up = at::vec::deinterleave2(value0, value1);
@@ -1249,7 +1569,7 @@ std::pair<at::Tensor, at::Tensor> execute_swiglu(
             }
             if (i < count) {
                 const int64_t width = count - i;
-                const Vec value = load_vec_as_float(values + i, width) * scale;
+                const Vec value = Vec::loadu(values + i, width) * scale;
                 store_float_as_vec(d_row + n + i, value, width);
                 const auto gate_up = at::vec::deinterleave2(value, Vec(0.0f));
                 const Vec output =
@@ -1288,7 +1608,7 @@ std::pair<at::Tensor, at::Tensor> execute_rope(
     T *o_ptr = O.data_ptr<T>();
     const float sign = backward ? -1.0f : 1.0f;
 
-    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const float *values) {
         T *d_row = d_ptr + m * N;
         T *o_row = o_ptr + m * N;
         const T *cs_row = cs_ptr + m * N;
@@ -1296,8 +1616,8 @@ std::pair<at::Tensor, at::Tensor> execute_rope(
         int64_t i = 0;
         if (r_ptr == nullptr) {
             for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
-                const Vec value0 = load_vec_as_float(values + i);
-                const Vec value1 = load_vec_as_float(values + i + Vec::size());
+                const Vec value0 = Vec::loadu(values + i);
+                const Vec value1 = Vec::loadu(values + i + Vec::size());
                 store_float_as_vec(d_row + n + i, value0);
                 store_float_as_vec(d_row + n + i + Vec::size(), value1);
                 const auto x = at::vec::deinterleave2(value0, value1);
@@ -1313,7 +1633,7 @@ std::pair<at::Tensor, at::Tensor> execute_rope(
             }
             if (i < count) {
                 const int64_t width = count - i;
-                const Vec value = load_vec_as_float(values + i, width);
+                const Vec value = Vec::loadu(values + i, width);
                 store_float_as_vec(d_row + n + i, value, width);
                 const auto x = at::vec::deinterleave2(value, Vec(0.0f));
                 const auto cs = at::vec::deinterleave2(
@@ -1327,8 +1647,8 @@ std::pair<at::Tensor, at::Tensor> execute_rope(
         } else {
             const Vec scale(r_ptr[m]);
             for (; i + 2 * Vec::size() <= count; i += 2 * Vec::size()) {
-                const Vec value0 = load_vec_as_float(values + i) * scale;
-                const Vec value1 = load_vec_as_float(values + i + Vec::size()) * scale;
+                const Vec value0 = Vec::loadu(values + i) * scale;
+                const Vec value1 = Vec::loadu(values + i + Vec::size()) * scale;
                 store_float_as_vec(d_row + n + i, value0);
                 store_float_as_vec(d_row + n + i + Vec::size(), value1);
                 const auto x = at::vec::deinterleave2(value0, value1);
@@ -1344,7 +1664,7 @@ std::pair<at::Tensor, at::Tensor> execute_rope(
             }
             if (i < count) {
                 const int64_t width = count - i;
-                const Vec value = load_vec_as_float(values + i, width) * scale;
+                const Vec value = Vec::loadu(values + i, width) * scale;
                 store_float_as_vec(d_row + n + i, value, width);
                 const auto x = at::vec::deinterleave2(value, Vec(0.0f));
                 const auto cs = at::vec::deinterleave2(
@@ -1379,25 +1699,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_residual_partial_rmsnorm(
     const int64_t N = B.size(1);
     const int64_t num_blocks = N / block_size;
     auto D = at::empty({M, N}, A.options().dtype(A.scalar_type()));
-    auto S = at::empty({M, num_blocks}, A.options().dtype(A.scalar_type()));
+    auto S_float = at::zeros({M, num_blocks}, A.options().dtype(at::kFloat));
     auto O = at::empty({M, N}, A.options().dtype(A.scalar_type()));
     const T *c_base = C.data_ptr<T>();
     const T *w_ptr = W.data_ptr<T>();
     T *d_ptr = D.data_ptr<T>();
-    T *s_ptr = S.data_ptr<T>();
+    float *s_float_ptr = S_float.data_ptr<float>();
     T *o_ptr = O.data_ptr<T>();
-    S.zero_();
 
-    visit_gemm_vectors_reduction<T>(A, B, block_size, [&](int64_t m, int64_t n, int64_t count, const T *values) {
+    visit_gemm_vectors_reduction<T>(A, B, block_size, [&](int64_t m, int64_t n, int64_t count, const float *values) {
         T *d_row = d_ptr + m * N;
-        T *s_row = s_ptr + m * num_blocks;
+        float *s_row = s_float_ptr + m * num_blocks;
         T *o_row = o_ptr + m * N;
         const T *c_row = c_base + m * N;
         for (int64_t i = 0; i < count; i += Vec::size()) {
             const int64_t width = std::min<int64_t>(Vec::size(), count - i);
             const int64_t col = n + i;
             const Vec value =
-                    load_vec_as_float(values + i, width) + load_vec_as_float(c_row + col, width);
+                    Vec::loadu(values + i, width) + load_vec_as_float(c_row + col, width);
             store_float_as_vec(d_row + col, value, width);
             store_float_as_vec(o_row + col, value * load_vec_as_float(w_ptr + col, width), width);
             if (col / block_size == (col + width - 1) / block_size) {
@@ -1412,23 +1731,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_residual_partial_rmsnorm(
                         sum_sq += scalar_values[j];
                     }
                 }
-                s_row[col / block_size] = static_cast<T>(
-                        static_cast<float>(s_row[col / block_size]) +
-                        sum_sq / static_cast<float>(block_size));
+                s_row[col / block_size] += sum_sq;
             } else {
                 alignas(64) std::array<float, Vec::size()> scalar_values;
                 value.store(scalar_values.data(), width);
                 for (int64_t j = 0; j < width; ++j) {
                     const float scalar = scalar_values[j];
-                    s_row[(col + j) / block_size] = static_cast<T>(
-                            static_cast<float>(s_row[(col + j) / block_size]) +
-                            (scalar * scalar) / static_cast<float>(block_size));
+                    s_row[(col + j) / block_size] += (scalar * scalar);
                 }
             }
         }
     });
 
-    return {D, S, O};
+    S_float.div_(static_cast<float>(block_size));
+    return {D, S_float, O};
 }
 
 template <typename T>
@@ -1452,14 +1768,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_partial_cross_entropy(
     const int64_t num_blocks = N / block_size;
     auto logits = at::empty({M, N}, A.options().dtype(A.scalar_type()));
     auto logits_tgt = at::empty({M}, A.options().dtype(A.scalar_type()));
-    auto logits_lse = at::empty({M, num_blocks}, A.options().dtype(A.scalar_type()));
+    auto logits_lse = at::empty({M, num_blocks}, A.options().dtype(at::kFloat));
     const T *a_base = A.data_ptr<T>();
     const T *b_base = B.data_ptr<T>();
     const float *r_ptr = R == nullptr ? nullptr : R->data_ptr<float>();
     const int64_t *targets_ptr = targets.data_ptr<int64_t>();
     T *logits_ptr = logits.data_ptr<T>();
     T *logits_tgt_ptr = logits_tgt.data_ptr<T>();
-    T *logits_lse_ptr = logits_lse.data_ptr<T>();
+    float *logits_lse_ptr = logits_lse.data_ptr<float>();
     constexpr int64_t vec_size = Vec::size();
 
     at::parallel_for(0, M, 1, [&](int64_t begin, int64_t end) {
@@ -1495,7 +1811,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> execute_partial_cross_entropy(
                         update_logsumexp(value, max_value, sum_exp);
                     }
                 }
-                logits_lse_ptr[m * num_blocks + block] = static_cast<T>(max_value + std::log(sum_exp));
+                logits_lse_ptr[m * num_blocks + block] = max_value + std::log(sum_exp);
             }
             TORCH_CHECK(target_seen, "target index was not visited");
         }
@@ -1670,6 +1986,16 @@ std::pair<at::Tensor, py::dict> execute_aten_vec_postops(
         return execute_aten_vec_postops_template<c10::BFloat16>(parsed_nodes, tensor_map, A, B);
     } else {
         TORCH_CHECK(false, "aten-vec provider only supports float32 and bfloat16 dtypes");
+    }
+#endif
+}
+
+void prepack_weight(const at::Tensor &B) {
+#if defined(CODA_CPU_WITH_ATEN_VEC)
+    if (B.scalar_type() == at::kFloat) {
+        pack_b_register_blocks<float, 4>(B);
+    } else if (B.scalar_type() == at::kBFloat16) {
+        pack_b_register_blocks<c10::BFloat16, 4>(B);
     }
 #endif
 }

@@ -35,4 +35,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("A"),
             py::arg("B"),
             py::arg("tensors"));
+    m.def(
+            "prepack_weight",
+            &coda::cpu::prepack_weight,
+            py::arg("B"));
 }
