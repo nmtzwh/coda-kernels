@@ -242,7 +242,8 @@ def run_decode_loop(
     max_new_tokens,
     is_qwen3,
     config,
-    use_coda=True
+    use_coda=True,
+    cpp_model=None
 ):
     B, T = input_ids.shape
     device = input_ids.device
@@ -256,7 +257,32 @@ def run_decode_loop(
     # 1. Prefill phase
     start_prefill = time.perf_counter()
     past_key_values = None
-    if use_coda:
+    if cpp_model is not None:
+        past_key_values = SimpleKVCache(
+            batch_size=B,
+            max_seq_len=T + max_new_tokens,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            num_layers=config.num_hidden_layers,
+            dtype=dtype,
+            device=device
+        )
+        position_ids = torch.arange(T, device=device).unsqueeze(0)
+        dummy_x = torch.empty((1,), dtype=dtype, device=device)
+        cos, sin = model.model.rotary_emb(x=dummy_x, position_ids=position_ids)
+        cos = cos.to(dtype=dtype)
+        sin = sin.to(dtype=dtype)
+        
+        logits = cpp_model.forward(
+            input_ids,
+            cos,
+            sin,
+            past_key_values.k_cache,
+            past_key_values.v_cache,
+            past_key_values.seq_len
+        )
+        past_key_values.increment_seq_len(T)
+    elif use_coda:
         # Pre-allocate cache
         past_key_values = SimpleKVCache(
             batch_size=B,
@@ -302,7 +328,24 @@ def run_decode_loop(
     start_decode = time.perf_counter()
     for i in range(max_new_tokens - 1):
         curr_token = tokens[-1]
-        if use_coda:
+        if cpp_model is not None:
+            T_past = past_key_values.seq_len
+            position_ids = torch.tensor([[T_past]], device=device)
+            dummy_x = torch.empty((1,), dtype=dtype, device=device)
+            cos, sin = model.model.rotary_emb(x=dummy_x, position_ids=position_ids)
+            cos = cos.to(dtype=dtype)
+            sin = sin.to(dtype=dtype)
+            
+            logits = cpp_model.forward(
+                curr_token,
+                cos,
+                sin,
+                past_key_values.k_cache,
+                past_key_values.v_cache,
+                past_key_values.seq_len
+            )
+            past_key_values.increment_seq_len(1)
+        elif use_coda:
             T_past = past_key_values.seq_len
             position_ids = torch.tensor([[T_past]], device=device)
             dummy_x = torch.empty((1,), dtype=dtype, device=device)
@@ -335,6 +378,65 @@ def run_decode_loop(
     decode_time = time.perf_counter() - start_decode
     return torch.cat(tokens, dim=-1), prefill_time, decode_time
 
+
+def make_cpp_model(model, fused_weights, config, is_qwen3):
+    from kernels.cpu.native import load_native_extension
+    native = load_native_extension()
+    if native is None or not hasattr(native, "CodaQwenModel"):
+        print("CodaQwenModel not available in native extension.")
+        return None
+    
+    # Extract weights
+    embed_tokens_weight = model.model.embed_tokens.weight
+    input_layernorm_weights = [fw.wn1 for fw in fused_weights]
+    post_attention_layernorm_weights = [fw.wn0 for fw in fused_weights]
+    w3_weights = [fw.w3 for fw in fused_weights]
+    
+    qkv_biases = []
+    for fw in fused_weights:
+        if fw.has_qkv_bias:
+            qkv_biases.append(fw.qkv_bias)
+        else:
+            qkv_biases.append(torch.empty((0,), dtype=embed_tokens_weight.dtype))
+            
+    w0_weights = [fw.w0 for fw in fused_weights]
+    w1_weights = [fw.w1 for fw in fused_weights]
+    w2_weights = [fw.w2 for fw in fused_weights]
+    
+    if is_qwen3:
+        q_norm_weights = [fw.q_norm.weight for fw in fused_weights]
+        k_norm_weights = [fw.k_norm.weight for fw in fused_weights]
+    else:
+        q_norm_weights = [torch.empty((0,), dtype=embed_tokens_weight.dtype) for _ in fused_weights]
+        k_norm_weights = [torch.empty((0,), dtype=embed_tokens_weight.dtype) for _ in fused_weights]
+        
+    final_norm_weight = model.model.norm.weight
+    lm_head_weight = model.lm_head.weight.t().contiguous()
+    
+    num_heads = config.num_attention_heads
+    num_kv_heads = config.num_key_value_heads
+    head_dim = getattr(config, "head_dim", config.hidden_size // num_heads)
+    
+    return native.CodaQwenModel(
+        embed_tokens_weight,
+        input_layernorm_weights,
+        post_attention_layernorm_weights,
+        w3_weights,
+        qkv_biases,
+        w0_weights,
+        w1_weights,
+        w2_weights,
+        q_norm_weights,
+        k_norm_weights,
+        final_norm_weight,
+        lm_head_weight,
+        config.rms_norm_eps,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        is_qwen3
+    )
+
 def main():
     parser = argparse.ArgumentParser(description="E2E LLM Inference benchmark using aten-vec fused operators.")
     parser.add_argument("--model-path", type=str, required=True, help="HF Cache snapshot path of the model.")
@@ -343,6 +445,7 @@ def main():
     parser.add_argument("--threads", type=int, default=8, help="Number of CPU threads.")
     parser.add_argument("--skip-compiled", action="store_true", help="Skip torch.compile benchmarking.")
     parser.add_argument("--dtype", type=str, choices=["float32", "bfloat16"], default="bfloat16", help="Precision (float32 or bfloat16).")
+    parser.add_argument("--pure-cpp", action="store_true", help="Benchmark pure C++ CodaQwenModel execution.")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
@@ -373,6 +476,14 @@ def main():
     input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids
     print(f"Prompt tokens: {input_ids.shape[1]}")
     
+    # Construct C++ CodaQwenModel if requested
+    cpp_model = None
+    if args.pure_cpp:
+        print("Constructing C++ CodaQwenModel...")
+        cpp_model = make_cpp_model(model, fused_weights, config, is_qwen3)
+        if cpp_model is None:
+            print("Warning: failed to construct C++ CodaQwenModel, falling back to python mode.")
+    
     # 1. Warmup & validation of correctness
     print("\n--- Correctness Validation ---")
     
@@ -402,10 +513,28 @@ def main():
     coda_text = tokenizer.decode(coda_tokens[0], skip_special_tokens=True)
     
     print(f"torch/native generated tokens: {ref_tokens[0].tolist()}")
+    print(f"torch/native detokenized: {ref_text}")
     print(f"cpu/aten-vec generated tokens: {coda_tokens[0].tolist()}")
+    print(f"cpu/aten-vec detokenized: {coda_text}")
     
     matching_tokens = (ref_tokens == coda_tokens).all().item()
-    print(f"Tokens match: {matching_tokens}")
+    print(f"Tokens match (cpu/aten-vec vs native): {matching_tokens}")
+
+    if cpp_model is not None:
+        cpp_tokens, cpp_pref_t, cpp_dec_t = run_decode_loop(
+            model=model,
+            fused_weights=fused_weights,
+            input_ids=input_ids.clone(),
+            max_new_tokens=args.gen_len,
+            is_qwen3=is_qwen3,
+            config=config,
+            cpp_model=cpp_model
+        )
+        cpp_text = tokenizer.decode(cpp_tokens[0], skip_special_tokens=True)
+        print(f"cpu/pure-cpp generated tokens: {cpp_tokens[0].tolist()}")
+        print(f"cpu/pure-cpp detokenized: {cpp_text}")
+        matching_cpp = (ref_tokens == cpp_tokens).all().item()
+        print(f"Tokens match (cpu/pure-cpp vs native): {matching_cpp}")
     
     # 2. Benchmarking latency & throughput
     print("\n--- Latency & Throughput Benchmarking ---")
@@ -449,6 +578,32 @@ def main():
     print(f"cpu/aten-vec:")
     print(f"  Prefill: elapsed={pref_coda:.3f} s, throughput={prompt_len / pref_coda:.2f} tok/s")
     print(f"  Decode:  elapsed={dec_coda:.3f} s, throughput={(args.gen_len - 1) / dec_coda:.2f} tok/s")
+
+    # Benchmark cpu/pure-cpp
+    if cpp_model is not None:
+        # Warmup first
+        run_decode_loop(
+            model=model,
+            fused_weights=fused_weights,
+            input_ids=input_ids.clone(),
+            max_new_tokens=args.gen_len,
+            is_qwen3=is_qwen3,
+            config=config,
+            cpp_model=cpp_model
+        )
+        
+        _, pref_cpp, dec_cpp = run_decode_loop(
+            model=model,
+            fused_weights=fused_weights,
+            input_ids=input_ids.clone(),
+            max_new_tokens=args.gen_len,
+            is_qwen3=is_qwen3,
+            config=config,
+            cpp_model=cpp_model
+        )
+        print(f"cpu/pure-cpp:")
+        print(f"  Prefill: elapsed={pref_cpp:.3f} s, throughput={prompt_len / pref_cpp:.2f} tok/s")
+        print(f"  Decode:  elapsed={dec_cpp:.3f} s, throughput={(args.gen_len - 1) / dec_cpp:.2f} tok/s")
     
     if not args.skip_compiled:
         try:

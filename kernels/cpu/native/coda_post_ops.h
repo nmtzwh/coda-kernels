@@ -77,4 +77,55 @@ std::pair<at::Tensor, pybind11::dict> execute_aten_vec_postops(
         const at::Tensor &B,
         const pybind11::dict &tensors);
 
+class CodaQwenModel {
+public:
+    at::Tensor embed_tokens_weight;
+    std::vector<at::Tensor> input_layernorm_weights;
+    std::vector<at::Tensor> post_attention_layernorm_weights;
+    std::vector<at::Tensor> w3_weights;
+    std::vector<at::Tensor> qkv_biases;
+    std::vector<at::Tensor> w0_weights;
+    std::vector<at::Tensor> w1_weights;
+    std::vector<at::Tensor> w2_weights;
+    std::vector<at::Tensor> q_norm_weights;
+    std::vector<at::Tensor> k_norm_weights;
+    at::Tensor final_norm_weight;
+    at::Tensor lm_head_weight;
+    double rms_norm_eps;
+    int64_t num_heads;
+    int64_t num_kv_heads;
+    int64_t head_dim;
+    bool is_qwen3;
+    int64_t num_layers;
+
+    CodaQwenModel(
+        at::Tensor embed_tokens_weight,
+        std::vector<at::Tensor> input_layernorm_weights,
+        std::vector<at::Tensor> post_attention_layernorm_weights,
+        std::vector<at::Tensor> w3_weights,
+        std::vector<at::Tensor> qkv_biases,
+        std::vector<at::Tensor> w0_weights,
+        std::vector<at::Tensor> w1_weights,
+        std::vector<at::Tensor> w2_weights,
+        std::vector<at::Tensor> q_norm_weights,
+        std::vector<at::Tensor> k_norm_weights,
+        at::Tensor final_norm_weight,
+        at::Tensor lm_head_weight,
+        double rms_norm_eps,
+        int64_t num_heads,
+        int64_t num_kv_heads,
+        int64_t head_dim,
+        bool is_qwen3
+    );
+
+    at::Tensor forward(
+        const at::Tensor &input_ids,
+        const at::Tensor &cos,
+        const at::Tensor &sin,
+        at::Tensor &k_cache,
+        at::Tensor &v_cache,
+        int64_t cache_index
+    );
+};
+
 }  // namespace coda::cpu

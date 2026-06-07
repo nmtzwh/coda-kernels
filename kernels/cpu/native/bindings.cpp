@@ -3,6 +3,7 @@
 #include "coda_post_ops.h"
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 namespace py = pybind11;
 
@@ -39,4 +40,52 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "prepack_weight",
             &coda::cpu::prepack_weight,
             py::arg("B"));
+
+    py::class_<coda::cpu::CodaQwenModel>(m, "CodaQwenModel")
+        .def(py::init<
+            at::Tensor,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            std::vector<at::Tensor>,
+            at::Tensor,
+            at::Tensor,
+            double,
+            int64_t,
+            int64_t,
+            int64_t,
+            bool
+        >(),
+        py::arg("embed_tokens_weight"),
+        py::arg("input_layernorm_weights"),
+        py::arg("post_attention_layernorm_weights"),
+        py::arg("w3_weights"),
+        py::arg("qkv_biases"),
+        py::arg("w0_weights"),
+        py::arg("w1_weights"),
+        py::arg("w2_weights"),
+        py::arg("q_norm_weights"),
+        py::arg("k_norm_weights"),
+        py::arg("final_norm_weight"),
+        py::arg("lm_head_weight"),
+        py::arg("rms_norm_eps"),
+        py::arg("num_heads"),
+        py::arg("num_kv_heads"),
+        py::arg("head_dim"),
+        py::arg("is_qwen3")
+        )
+        .def("forward", &coda::cpu::CodaQwenModel::forward,
+            py::arg("input_ids"),
+            py::arg("cos"),
+            py::arg("sin"),
+            py::arg("k_cache"),
+            py::arg("v_cache"),
+            py::arg("cache_index")
+        );
 }
+

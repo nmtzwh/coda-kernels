@@ -2000,4 +2000,516 @@ void prepack_weight(const at::Tensor &B) {
 #endif
 }
 
+
+#if defined(CODA_CPU_WITH_ATEN_VEC)
+template <typename T>
+at::Tensor execute_gemm_pure(const at::Tensor &A, const at::Tensor &B) {
+    require_gemm_inputs_template<T>(A, B);
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(1);
+    auto D = at::empty({M, N}, A.options().dtype(A.scalar_type()));
+    T *d_ptr = D.data_ptr<T>();
+    visit_gemm_vectors<T>(A, B, [&](int64_t m, int64_t n, int64_t count, const float *values) {
+        T *d_row = d_ptr + m * N;
+        for (int64_t i = 0; i < count; i += Vec::size()) {
+            const int64_t width = std::min<int64_t>(Vec::size(), count - i);
+            const Vec value = Vec::loadu(values + i, width);
+            store_float_as_vec(d_row + n + i, value, width);
+        }
+    });
+    return D;
+}
+
+template <typename T>
+void apply_rope_half_one_vector(
+    T *out,
+    const T *in,
+    const T *cos_ptr,
+    const T *sin_ptr,
+    int64_t head_dim
+) {
+    const int64_t half = head_dim / 2;
+    int64_t i = 0;
+    for (; i <= half - Vec::size(); i += Vec::size()) {
+        Vec x1 = load_vec_as_float(in + i);
+        Vec x2 = load_vec_as_float(in + i + half);
+        Vec c1 = load_vec_as_float(cos_ptr + i);
+        Vec s1 = load_vec_as_float(sin_ptr + i);
+        Vec y1 = x1 * c1 - x2 * s1;
+        store_float_as_vec(out + i, y1);
+        Vec c2 = load_vec_as_float(cos_ptr + i + half);
+        Vec s2 = load_vec_as_float(sin_ptr + i + half);
+        Vec y2 = x2 * c2 + x1 * s2;
+        store_float_as_vec(out + i + half, y2);
+    }
+    for (; i < half; ++i) {
+        float x1 = static_cast<float>(in[i]);
+        float x2 = static_cast<float>(in[i + half]);
+        float c1 = static_cast<float>(cos_ptr[i]);
+        float s1 = static_cast<float>(sin_ptr[i]);
+        out[i] = static_cast<T>(x1 * c1 - x2 * s1);
+        float c2 = static_cast<float>(cos_ptr[i + half]);
+        float s2 = static_cast<float>(sin_ptr[i + half]);
+        out[i + half] = static_cast<T>(x2 * c2 + x1 * s2);
+    }
+}
+
+template <typename T>
+at::Tensor apply_rmsnorm(const at::Tensor &x, const at::Tensor &w, double eps) {
+    const int64_t N = w.size(0);
+    const int64_t M = x.numel() / N;
+    auto y = at::empty_like(x);
+    const T *x_ptr = x.data_ptr<T>();
+    const T *w_ptr = w.data_ptr<T>();
+    T *y_ptr = y.data_ptr<T>();
+    auto worker = [&](int64_t begin, int64_t end) {
+        for (int64_t m = begin; m < end; ++m) {
+            const T *x_row = x_ptr + m * N;
+            T *y_row = y_ptr + m * N;
+            float sum_sq = 0.0f;
+            int64_t d = 0;
+            Vec sum_sq_vec(0.0f);
+            for (; d <= N - Vec::size(); d += Vec::size()) {
+                Vec xv = load_vec_as_float(x_row + d);
+                sum_sq_vec = sum_sq_vec + xv * xv;
+            }
+            sum_sq = vec_reduce_sum(sum_sq_vec);
+            for (; d < N; ++d) {
+                float xv = static_cast<float>(x_row[d]);
+                sum_sq += xv * xv;
+            }
+            float rstd = 1.0f / std::sqrt(sum_sq / N + static_cast<float>(eps));
+            d = 0;
+            Vec rstd_vec(rstd);
+            for (; d <= N - Vec::size(); d += Vec::size()) {
+                Vec xv = load_vec_as_float(x_row + d);
+                Vec wv = load_vec_as_float(w_ptr + d);
+                Vec yv = xv * rstd_vec * wv;
+                store_float_as_vec(y_row + d, yv);
+            }
+            for (; d < N; ++d) {
+                y_row[d] = static_cast<T>(static_cast<float>(x_row[d]) * rstd * static_cast<float>(w_ptr[d]));
+            }
+        }
+    };
+    if (M > 1) {
+        at::parallel_for(0, M, 1, worker);
+    } else {
+        worker(0, M);
+    }
+    return y;
+}
+
+template <typename T>
+at::Tensor split_transpose_rope_cache_template(
+    const at::Tensor &qkv,
+    const at::Tensor &cos,
+    const at::Tensor &sin,
+    at::Tensor &k_cache,
+    at::Tensor &v_cache,
+    int64_t layer_idx,
+    int64_t cache_index,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    bool is_qwen3,
+    const at::Tensor &q_norm_w,
+    const at::Tensor &k_norm_w,
+    double rms_norm_eps
+) {
+    const int64_t B = qkv.size(0);
+    const int64_t T_seq = qkv.size(1);
+    auto Q_out = at::empty({B, num_heads, T_seq, head_dim}, qkv.options());
+    const T *qkv_ptr = qkv.data_ptr<T>();
+    const T *cos_ptr = cos.data_ptr<T>();
+    const T *sin_ptr = sin.data_ptr<T>();
+    T *q_out_ptr = Q_out.data_ptr<T>();
+    T *k_cache_ptr = k_cache.data_ptr<T>();
+    T *v_cache_ptr = v_cache.data_ptr<T>();
+    const int64_t k_layer_stride = k_cache.stride(0);
+    const int64_t k_batch_stride = k_cache.stride(1);
+    const int64_t k_kv_head_stride = k_cache.stride(2);
+    const int64_t k_seq_stride = k_cache.stride(3);
+    const int64_t k_dim_stride = k_cache.stride(4);
+    const int64_t v_layer_stride = v_cache.stride(0);
+    const int64_t v_batch_stride = v_cache.stride(1);
+    const int64_t v_kv_head_stride = v_cache.stride(2);
+    const int64_t v_seq_stride = v_cache.stride(3);
+    const int64_t v_dim_stride = v_cache.stride(4);
+    const int64_t q_dim = num_heads * head_dim;
+    const int64_t k_dim = num_kv_heads * head_dim;
+    const int64_t qkv_dim = q_dim + 2 * k_dim;
+    auto worker = [&](int64_t begin, int64_t end) {
+        std::vector<float> q_norm_buf;
+        std::vector<float> k_norm_buf;
+        if (is_qwen3) {
+            q_norm_buf.resize(q_dim);
+            k_norm_buf.resize(k_dim);
+        }
+        for (int64_t bt = begin; bt < end; ++bt) {
+            const int64_t b = bt / T_seq;
+            const int64_t t = bt % T_seq;
+            const T *src_qkv = qkv_ptr + b * T_seq * qkv_dim + t * qkv_dim;
+            const T *src_q = src_qkv;
+            const T *src_k = src_qkv + q_dim;
+            const T *src_v = src_qkv + q_dim + k_dim;
+            const int64_t seq_len_cos = cos.size(cos.dim() - 2);
+            const int64_t t_cos = (seq_len_cos == 1) ? 0 : t;
+            const T *cos_step = cos_ptr + t_cos * cos.stride(cos.dim() - 2);
+            const T *sin_step = sin_ptr + t_cos * sin.stride(sin.dim() - 2);
+            if (is_qwen3) {
+                const T *qw = q_norm_w.data_ptr<T>();
+                for (int64_t h = 0; h < num_heads; ++h) {
+                    const T *q_head = src_q + h * head_dim;
+                    const T *qw_head = qw;
+                    float sum_sq = 0.0f;
+                    for (int64_t d = 0; d < head_dim; ++d) {
+                        float val = static_cast<float>(q_head[d]);
+                        sum_sq += val * val;
+                    }
+                    float rstd = 1.0f / std::sqrt(sum_sq / head_dim + static_cast<float>(rms_norm_eps));
+                    for (int64_t d = 0; d < head_dim; ++d) {
+                        q_norm_buf[h * head_dim + d] = static_cast<float>(q_head[d]) * rstd * static_cast<float>(qw_head[d]);
+                    }
+                }
+                const T *kw = k_norm_w.data_ptr<T>();
+                for (int64_t h = 0; h < num_kv_heads; ++h) {
+                    const T *k_head = src_k + h * head_dim;
+                    const T *kw_head = kw;
+                    float sum_sq = 0.0f;
+                    for (int64_t d = 0; d < head_dim; ++d) {
+                        float val = static_cast<float>(k_head[d]);
+                        sum_sq += val * val;
+                    }
+                    float rstd = 1.0f / std::sqrt(sum_sq / head_dim + static_cast<float>(rms_norm_eps));
+                    for (int64_t d = 0; d < head_dim; ++d) {
+                        k_norm_buf[h * head_dim + d] = static_cast<float>(k_head[d]) * rstd * static_cast<float>(kw_head[d]);
+                    }
+                }
+            }
+            for (int64_t h = 0; h < num_heads; ++h) {
+                T *dst_q = q_out_ptr + b * num_heads * T_seq * head_dim + h * T_seq * head_dim + t * head_dim;
+                alignas(16) T temp_in[512];
+                if (is_qwen3) {
+                    for (int64_t d = 0; d < head_dim; ++d) {
+                        temp_in[d] = static_cast<T>(q_norm_buf[h * head_dim + d]);
+                    }
+                } else {
+                    std::copy_n(src_q + h * head_dim, head_dim, temp_in);
+                }
+                apply_rope_half_one_vector<T>(dst_q, temp_in, cos_step, sin_step, head_dim);
+            }
+            for (int64_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
+                T *dst_k = k_cache_ptr + layer_idx * k_layer_stride + b * k_batch_stride + kv_h * k_kv_head_stride + (cache_index + t) * k_seq_stride;
+                alignas(16) T temp_in[512];
+                if (is_qwen3) {
+                    for (int64_t d = 0; d < head_dim; ++d) {
+                        temp_in[d] = static_cast<T>(k_norm_buf[kv_h * head_dim + d]);
+                    }
+                } else {
+                    std::copy_n(src_k + kv_h * head_dim, head_dim, temp_in);
+                }
+                alignas(16) T temp_out[512];
+                apply_rope_half_one_vector<T>(temp_out, temp_in, cos_step, sin_step, head_dim);
+                for (int64_t d = 0; d < head_dim; ++d) {
+                    dst_k[d * k_dim_stride] = temp_out[d];
+                }
+            }
+            for (int64_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
+                T *dst_v = v_cache_ptr + layer_idx * v_layer_stride + b * v_batch_stride + kv_h * v_kv_head_stride + (cache_index + t) * v_seq_stride;
+                const T *src_v_head = src_v + kv_h * head_dim;
+                for (int64_t d = 0; d < head_dim; ++d) {
+                    dst_v[d * v_dim_stride] = src_v_head[d];
+                }
+            }
+        }
+    };
+    if (B * T_seq > 1) {
+        at::parallel_for(0, B * T_seq, 1, worker);
+    } else {
+        worker(0, B * T_seq);
+    }
+    return Q_out;
+}
+
+template <typename T>
+at::Tensor coda_decode_attention_impl(
+    const at::Tensor &Q,
+    const at::Tensor &k_cache,
+    const at::Tensor &v_cache,
+    int64_t layer_idx,
+    int64_t seq_len,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim
+) {
+    const int64_t B = Q.size(0);
+    auto Y = at::empty({B, 1, num_heads * head_dim}, Q.options());
+    const T *q_ptr = Q.data_ptr<T>();
+    const T *k_ptr = k_cache.data_ptr<T>();
+    const T *v_ptr = v_cache.data_ptr<T>();
+    T *y_ptr = Y.data_ptr<T>();
+    const int64_t group_size = num_heads / num_kv_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const int64_t k_layer_stride = k_cache.stride(0);
+    const int64_t k_batch_stride = k_cache.stride(1);
+    const int64_t k_kv_head_stride = k_cache.stride(2);
+    const int64_t k_seq_stride = k_cache.stride(3);
+    const int64_t k_dim_stride = k_cache.stride(4);
+    const int64_t v_layer_stride = v_cache.stride(0);
+    const int64_t v_batch_stride = v_cache.stride(1);
+    const int64_t v_kv_head_stride = v_cache.stride(2);
+    const int64_t v_seq_stride = v_cache.stride(3);
+    const int64_t v_dim_stride = v_cache.stride(4);
+    const int64_t q_batch_stride = Q.stride(0);
+    const int64_t q_head_stride = Q.stride(1);
+    const int64_t q_dim_stride = Q.dim() == 4 ? Q.stride(3) : Q.stride(2);
+    const int64_t y_batch_stride = num_heads * head_dim;
+    const int64_t y_head_stride = head_dim;
+    const int64_t y_dim_stride = 1;
+    const bool use_parallel = (B * num_heads * seq_len * head_dim) >= 65536;
+    auto worker = [&](int64_t begin, int64_t end) {
+        float *scores = nullptr;
+        std::vector<float> scores_vec;
+        if (seq_len < 4096) {
+            scores = (float*)alloca(seq_len * sizeof(float));
+        } else {
+            scores_vec.resize(seq_len);
+            scores = scores_vec.data();
+        }
+        for (int64_t bh = begin; bh < end; ++bh) {
+            const int64_t b = bh / num_heads;
+            const int64_t h = bh % num_heads;
+            const int64_t kv_h = h / group_size;
+            const T *q_head_ptr = q_ptr + b * q_batch_stride + h * q_head_stride;
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (int64_t j = 0; j < seq_len; ++j) {
+                const T *k_vec_ptr = k_ptr + layer_idx * k_layer_stride + b * k_batch_stride + kv_h * k_kv_head_stride + j * k_seq_stride;
+                float sum = 0.0f;
+                int64_t d = 0;
+                Vec sum_vec(0.0f);
+                for (; d <= head_dim - Vec::size(); d += Vec::size()) {
+                    Vec q_v = load_vec_as_float(q_head_ptr + d * q_dim_stride);
+                    Vec k_v = load_vec_as_float(k_vec_ptr + d * k_dim_stride);
+                    sum_vec = sum_vec + q_v * k_v;
+                }
+                sum = vec_reduce_sum(sum_vec);
+                for (; d < head_dim; ++d) {
+                    sum += static_cast<float>(q_head_ptr[d * q_dim_stride]) * static_cast<float>(k_vec_ptr[d * k_dim_stride]);
+                }
+                float score = sum * scale;
+                scores[j] = score;
+                if (score > max_score) {
+                    max_score = score;
+                }
+            }
+            float sum_exp = 0.0f;
+            for (int64_t j = 0; j < seq_len; ++j) {
+                scores[j] = std::exp(scores[j] - max_score);
+                sum_exp += scores[j];
+            }
+            float inv_sum_exp = 1.0f / sum_exp;
+            for (int64_t j = 0; j < seq_len; ++j) {
+                scores[j] *= inv_sum_exp;
+            }
+            T *y_head_ptr = y_ptr + b * y_batch_stride + h * y_head_stride;
+            for (int64_t d = 0; d < head_dim; ++d) {
+                y_head_ptr[d * y_dim_stride] = static_cast<T>(0.0f);
+            }
+            for (int64_t j = 0; j < seq_len; ++j) {
+                const float sj = scores[j];
+                const T *v_vec_ptr = v_ptr + layer_idx * v_layer_stride + b * v_batch_stride + kv_h * v_kv_head_stride + j * v_seq_stride;
+                int64_t d = 0;
+                Vec sj_vec(sj);
+                for (; d <= head_dim - Vec::size(); d += Vec::size()) {
+                    Vec y_v = load_vec_as_float(y_head_ptr + d * y_dim_stride);
+                    Vec v_v = load_vec_as_float(v_vec_ptr + d * v_dim_stride);
+                    y_v = y_v + sj_vec * v_v;
+                    store_float_as_vec(y_head_ptr + d * y_dim_stride, y_v);
+                }
+                for (; d < head_dim; ++d) {
+                    y_head_ptr[d * y_dim_stride] = static_cast<T>(static_cast<float>(y_head_ptr[d * y_dim_stride]) + sj * static_cast<float>(v_vec_ptr[d * v_dim_stride]));
+                }
+            }
+        }
+    };
+    if (use_parallel) {
+        at::parallel_for(0, B * num_heads, 1, worker);
+    } else {
+        worker(0, B * num_heads);
+    }
+    return Y;
+}
+
+template <typename T>
+at::Tensor coda_qwen_forward_template(
+    CodaQwenModel &model,
+    const at::Tensor &input_ids,
+    const at::Tensor &cos,
+    const at::Tensor &sin,
+    at::Tensor &k_cache,
+    at::Tensor &v_cache,
+    int64_t cache_index
+) {
+    const int64_t B = input_ids.size(0);
+    const int64_t T_seq = input_ids.size(1);
+    auto x = at::embedding(model.embed_tokens_weight, input_ids);
+    auto input_norm_w = model.input_layernorm_weights[0];
+    auto h = apply_rmsnorm<T>(x, input_norm_w, model.rms_norm_eps);
+    auto w3 = model.w3_weights[0];
+    auto h_2d = h.reshape({B * T_seq, -1});
+    auto qkv_2d = at::matmul(h_2d, w3);
+    if (model.qkv_biases[0].defined() && model.qkv_biases[0].numel() > 0) {
+        qkv_2d.add_(model.qkv_biases[0]);
+    }
+    auto qkv = qkv_2d.reshape({B, T_seq, -1});
+    auto x_current = x;
+    for (int64_t l = 0; l < model.num_layers; ++l) {
+        at::Tensor q_norm_w = model.q_norm_weights[l];
+        at::Tensor k_norm_w = model.k_norm_weights[l];
+        auto q = split_transpose_rope_cache_template<T>(
+            qkv, cos, sin, k_cache, v_cache, l, cache_index,
+            model.num_heads, model.num_kv_heads, model.head_dim, model.is_qwen3,
+            q_norm_w, k_norm_w, model.rms_norm_eps
+        );
+        at::Tensor attn_out;
+        if (T_seq > 1) {
+            auto k_full = k_cache.select(0, l).slice(2, 0, cache_index + T_seq);
+            auto v_full = v_cache.select(0, l).slice(2, 0, cache_index + T_seq);
+            if (model.num_heads != model.num_kv_heads) {
+                const int64_t group_size = model.num_heads / model.num_kv_heads;
+                auto q_5d = q.view({B, model.num_kv_heads, group_size, T_seq, model.head_dim});
+                auto k_5d = k_full.unsqueeze(2);
+                auto v_5d = v_full.unsqueeze(2);
+                auto attn_out_5d = at::scaled_dot_product_attention(q_5d, k_5d, v_5d, {}, 0.0, true);
+                attn_out = attn_out_5d.view({B, model.num_heads, T_seq, model.head_dim});
+            } else {
+                attn_out = at::scaled_dot_product_attention(q, k_full, v_full, {}, 0.0, true);
+            }
+            attn_out = attn_out.transpose(1, 2).reshape({B, T_seq, -1}).contiguous();
+        } else {
+            attn_out = coda_decode_attention_impl<T>(
+                q, k_cache, v_cache, l, cache_index + 1,
+                model.num_heads, model.num_kv_heads, model.head_dim
+            );
+        }
+        auto w0 = model.w0_weights[l];
+        auto w1 = model.w1_weights[l];
+        auto wn0 = model.post_attention_layernorm_weights[l];
+        auto M_size = B * T_seq;
+        auto attn_out_2d = attn_out.reshape({M_size, -1});
+        auto x_current_2d = x_current.reshape({M_size, -1});
+        auto rmsnorm_outputs = execute_residual_partial_rmsnorm<T>(
+            attn_out_2d, w0, x_current_2d, wn0, 128
+        );
+        auto x_mlp_res_2d = std::get<0>(rmsnorm_outputs);
+        auto s_mlp = std::get<1>(rmsnorm_outputs);
+        auto h_mlp_2d = std::get<2>(rmsnorm_outputs);
+        auto rstd_mlp = 1.0f / at::sqrt(s_mlp.mean(1) + model.rms_norm_eps);
+        auto swiglu_outputs = execute_swiglu<T>(h_mlp_2d, w1, &rstd_mlp);
+        auto y_swiglu_2d = swiglu_outputs.second;
+        if (l < model.num_layers - 1) {
+            auto w2 = model.w2_weights[l];
+            auto w3_next = model.w3_weights[l + 1];
+            auto wn1_next = model.input_layernorm_weights[l + 1];
+            auto next_outputs = execute_residual_partial_rmsnorm<T>(
+                y_swiglu_2d, w2, x_mlp_res_2d, wn1_next, 128
+            );
+            auto x_next_2d = std::get<0>(next_outputs);
+            auto s_next = std::get<1>(next_outputs);
+            auto h_next_2d = std::get<2>(next_outputs);
+            auto rstd_next = 1.0f / at::sqrt(s_next.mean(1) + model.rms_norm_eps);
+            auto qkv_next_2d = execute_row_scale<T>(h_next_2d, w3_next, rstd_next);
+            if (model.qkv_biases[l + 1].defined() && model.qkv_biases[l + 1].numel() > 0) {
+                qkv_next_2d.add_(model.qkv_biases[l + 1]);
+            }
+            qkv = qkv_next_2d.reshape({B, T_seq, -1});
+            x_current = x_next_2d.reshape({B, T_seq, -1});
+        } else {
+            auto w2 = model.w2_weights[l];
+            auto x_final_2d = x_mlp_res_2d + at::matmul(y_swiglu_2d, w2);
+            auto x_final = x_final_2d.reshape({B, T_seq, -1});
+            auto h_final = apply_rmsnorm<T>(x_final, model.final_norm_weight, model.rms_norm_eps);
+            auto h_final_2d = h_final.reshape({B * T_seq, -1});
+            auto logits_2d = at::matmul(h_final_2d, model.lm_head_weight);
+            auto logits = logits_2d.reshape({B, T_seq, -1});
+            return logits;
+        }
+    }
+    throw std::runtime_error("Unexpected end of layer loop");
+}
+#endif
+
+CodaQwenModel::CodaQwenModel(
+    at::Tensor embed_tokens_weight,
+    std::vector<at::Tensor> input_layernorm_weights,
+    std::vector<at::Tensor> post_attention_layernorm_weights,
+    std::vector<at::Tensor> w3_weights,
+    std::vector<at::Tensor> qkv_biases,
+    std::vector<at::Tensor> w0_weights,
+    std::vector<at::Tensor> w1_weights,
+    std::vector<at::Tensor> w2_weights,
+    std::vector<at::Tensor> q_norm_weights,
+    std::vector<at::Tensor> k_norm_weights,
+    at::Tensor final_norm_weight,
+    at::Tensor lm_head_weight,
+    double rms_norm_eps,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    bool is_qwen3
+) {
+#if !defined(CODA_CPU_WITH_ATEN_VEC)
+    throw std::runtime_error("ATen vector provider was not compiled into this native extension");
+#else
+    this->embed_tokens_weight = embed_tokens_weight;
+    this->input_layernorm_weights = input_layernorm_weights;
+    this->post_attention_layernorm_weights = post_attention_layernorm_weights;
+    this->w3_weights = w3_weights;
+    this->qkv_biases = qkv_biases;
+    this->w0_weights = w0_weights;
+    this->w1_weights = w1_weights;
+    this->w2_weights = w2_weights;
+    this->q_norm_weights = q_norm_weights;
+    this->k_norm_weights = k_norm_weights;
+    this->final_norm_weight = final_norm_weight;
+    this->lm_head_weight = lm_head_weight;
+    this->rms_norm_eps = rms_norm_eps;
+    this->num_heads = num_heads;
+    this->num_kv_heads = num_kv_heads;
+    this->head_dim = head_dim;
+    this->is_qwen3 = is_qwen3;
+    this->num_layers = w3_weights.size();
+
+    // Safely prepack weights in the constructor to ensure cache residency
+    for (auto &w : this->w0_weights) prepack_weight(w);
+    for (auto &w : this->w1_weights) prepack_weight(w);
+    for (auto &w : this->w2_weights) prepack_weight(w);
+    for (auto &w : this->w3_weights) prepack_weight(w);
+    prepack_weight(this->lm_head_weight);
+#endif
+}
+
+at::Tensor CodaQwenModel::forward(
+    const at::Tensor &input_ids,
+    const at::Tensor &cos,
+    const at::Tensor &sin,
+    at::Tensor &k_cache,
+    at::Tensor &v_cache,
+    int64_t cache_index
+) {
+#if !defined(CODA_CPU_WITH_ATEN_VEC)
+    throw std::runtime_error("ATen vector provider was not compiled into this native extension");
+#else
+    if (embed_tokens_weight.scalar_type() == at::kFloat) {
+        return coda_qwen_forward_template<float>(*this, input_ids, cos, sin, k_cache, v_cache, cache_index);
+    } else if (embed_tokens_weight.scalar_type() == at::kBFloat16) {
+        return coda_qwen_forward_template<c10::BFloat16>(*this, input_ids, cos, sin, k_cache, v_cache, cache_index);
+    } else {
+        TORCH_CHECK(false, "CodaQwenModel only supports float32 and bfloat16 dtypes");
+    }
+#endif
+}
+
 }  // namespace coda::cpu
+
