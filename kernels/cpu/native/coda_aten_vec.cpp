@@ -2470,6 +2470,129 @@ at::Tensor coda_qwen_forward_template(
 }
 #endif
 
+at::Tensor execute_aten_vec_gemm(const at::Tensor &A, const at::Tensor &B) {
+#if !defined(CODA_CPU_WITH_ATEN_VEC)
+    (void)A;
+    (void)B;
+    throw std::runtime_error("ATen vector provider was not compiled into this native extension");
+#else
+    if (A.scalar_type() == at::kFloat) {
+        return execute_gemm_pure<float>(A, B);
+    } else if (A.scalar_type() == at::kBFloat16) {
+        return execute_gemm_pure<c10::BFloat16>(A, B);
+    } else {
+        TORCH_CHECK(false, "aten-vec GEMM only supports float32 and bfloat16 dtypes");
+    }
+#endif
+    return at::Tensor();
+}
+
+at::Tensor execute_aten_vec_rmsnorm(
+        const at::Tensor &x,
+        const at::Tensor &w,
+        double eps) {
+#if !defined(CODA_CPU_WITH_ATEN_VEC)
+    (void)x;
+    (void)w;
+    (void)eps;
+    throw std::runtime_error("ATen vector provider was not compiled into this native extension");
+#else
+    TORCH_CHECK(x.scalar_type() == w.scalar_type(), "rmsnorm inputs must have the same dtype");
+    if (x.scalar_type() == at::kFloat) {
+        return apply_rmsnorm<float>(x, w, eps);
+    } else if (x.scalar_type() == at::kBFloat16) {
+        return apply_rmsnorm<c10::BFloat16>(x, w, eps);
+    } else {
+        TORCH_CHECK(false, "aten-vec RMSNorm only supports float32 and bfloat16 dtypes");
+    }
+#endif
+    return at::Tensor();
+}
+
+at::Tensor execute_aten_vec_split_transpose_rope_cache(
+        const at::Tensor &qkv,
+        const at::Tensor &cos,
+        const at::Tensor &sin,
+        at::Tensor &k_cache,
+        at::Tensor &v_cache,
+        int64_t layer_idx,
+        int64_t cache_index,
+        int64_t num_heads,
+        int64_t num_kv_heads,
+        int64_t head_dim,
+        bool is_qwen3,
+        const at::Tensor &q_norm_w,
+        const at::Tensor &k_norm_w,
+        double rms_norm_eps) {
+#if !defined(CODA_CPU_WITH_ATEN_VEC)
+    (void)qkv;
+    (void)cos;
+    (void)sin;
+    (void)k_cache;
+    (void)v_cache;
+    (void)layer_idx;
+    (void)cache_index;
+    (void)num_heads;
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)is_qwen3;
+    (void)q_norm_w;
+    (void)k_norm_w;
+    (void)rms_norm_eps;
+    throw std::runtime_error("ATen vector provider was not compiled into this native extension");
+#else
+    if (qkv.scalar_type() == at::kFloat) {
+        return split_transpose_rope_cache_template<float>(
+                qkv, cos, sin, k_cache, v_cache, layer_idx, cache_index,
+                num_heads, num_kv_heads, head_dim, is_qwen3,
+                q_norm_w, k_norm_w, rms_norm_eps);
+    } else if (qkv.scalar_type() == at::kBFloat16) {
+        return split_transpose_rope_cache_template<c10::BFloat16>(
+                qkv, cos, sin, k_cache, v_cache, layer_idx, cache_index,
+                num_heads, num_kv_heads, head_dim, is_qwen3,
+                q_norm_w, k_norm_w, rms_norm_eps);
+    } else {
+        TORCH_CHECK(false, "aten-vec split/RoPE/cache only supports float32 and bfloat16 dtypes");
+    }
+#endif
+    return at::Tensor();
+}
+
+at::Tensor execute_aten_vec_decode_attention(
+        const at::Tensor &Q,
+        const at::Tensor &k_cache,
+        const at::Tensor &v_cache,
+        int64_t layer_idx,
+        int64_t seq_len,
+        int64_t num_heads,
+        int64_t num_kv_heads,
+        int64_t head_dim) {
+#if !defined(CODA_CPU_WITH_ATEN_VEC)
+    (void)Q;
+    (void)k_cache;
+    (void)v_cache;
+    (void)layer_idx;
+    (void)seq_len;
+    (void)num_heads;
+    (void)num_kv_heads;
+    (void)head_dim;
+    throw std::runtime_error("ATen vector provider was not compiled into this native extension");
+#else
+    if (Q.scalar_type() == at::kFloat) {
+        return coda_decode_attention_impl<float>(
+                Q, k_cache, v_cache, layer_idx, seq_len,
+                num_heads, num_kv_heads, head_dim);
+    } else if (Q.scalar_type() == at::kBFloat16) {
+        return coda_decode_attention_impl<c10::BFloat16>(
+                Q, k_cache, v_cache, layer_idx, seq_len,
+                num_heads, num_kv_heads, head_dim);
+    } else {
+        TORCH_CHECK(false, "aten-vec decode attention only supports float32 and bfloat16 dtypes");
+    }
+#endif
+    return at::Tensor();
+}
+
 CodaQwenModel::CodaQwenModel(
     at::Tensor embed_tokens_weight,
     std::vector<at::Tensor> input_layernorm_weights,

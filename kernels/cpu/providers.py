@@ -167,6 +167,13 @@ class CpuGemmProvider:
             raise ValueError(f"incompatible GEMM shapes: {tuple(A.shape)} x {tuple(B.shape)}")
         return _to_acc(A).mm(_to_acc(B))
 
+    def matmul(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        _require_matrix("A", A)
+        _require_matrix("B", B)
+        if A.shape[1] != B.shape[0]:
+            raise ValueError(f"incompatible GEMM shapes: {tuple(A.shape)} x {tuple(B.shape)}")
+        return A.mm(B)
+
     def execute(
         self,
         program: GemmEpilogueProgram,
@@ -487,6 +494,22 @@ class AtenVecProvider(CpuGemmProvider):
             )
 
         return False
+
+    def matmul(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        _require_matrix("A", A)
+        _require_matrix("B", B)
+        if A.shape[1] != B.shape[0]:
+            raise ValueError(f"incompatible GEMM shapes: {tuple(A.shape)} x {tuple(B.shape)}")
+        native = load_native_extension()
+        if (
+            native is not None
+            and hasattr(native, "execute_aten_vec_gemm")
+            and _is_contiguous_f32_or_bf16(A)
+            and _is_contiguous_f32_or_bf16(B)
+            and A.dtype == B.dtype
+        ):
+            return native.execute_aten_vec_gemm(A, B)
+        return super().matmul(A, B)
 
     def execute(
         self,

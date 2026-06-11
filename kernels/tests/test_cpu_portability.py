@@ -177,6 +177,56 @@ def test_cpp_decode_projection_path_uses_aten_vec_gemm() -> None:
     assert "auto logits_2d = execute_gemm_pure<T>(h_final_2d, model.lm_head_weight);" in forward_source
 
 
+def test_python_llm_forward_uses_provider_for_direct_decode_gemms() -> None:
+    source = (
+        Path(__file__).parents[1] / "benchmarks" / "llm_inference.py"
+    ).read_text(encoding="utf-8")
+    start = source.index("def coda_forward(")
+    end = source.index("def run_decode_loop(")
+    forward_source = source[start:end]
+
+    assert ".matmul(" not in forward_source
+    assert "model.lm_head(" not in forward_source
+    assert "_cpu_provider_matmul(h, l0_weights.w3)" in forward_source
+    assert "_cpu_provider_matmul(y_swiglu, l_weights.w2)" in forward_source
+    assert "_cpu_provider_matmul(h_final, lm_head_weight)" in forward_source
+    assert "native.execute_aten_vec_rmsnorm" in forward_source
+    assert "native.execute_aten_vec_split_transpose_rope_cache" in forward_source
+    assert "native.execute_aten_vec_decode_attention" in forward_source
+
+
+def test_aten_vec_provider_exposes_python_orchestration_kernels() -> None:
+    native_dir = Path(__file__).parents[1] / "cpu" / "native"
+    header = (native_dir / "coda_post_ops.h").read_text(encoding="utf-8")
+    bindings = (native_dir / "bindings.cpp").read_text(encoding="utf-8")
+    provider = (
+        Path(__file__).parents[1] / "cpu" / "providers.py"
+    ).read_text(encoding="utf-8")
+
+    assert "execute_aten_vec_gemm" in header
+    assert '"execute_aten_vec_gemm"' in bindings
+    assert "def matmul(self, A: torch.Tensor, B: torch.Tensor)" in provider
+    assert "native.execute_aten_vec_gemm(A, B)" in provider
+    for name in (
+        "execute_aten_vec_rmsnorm",
+        "execute_aten_vec_split_transpose_rope_cache",
+        "execute_aten_vec_decode_attention",
+    ):
+        assert name in header
+        assert f'"{name}"' in bindings
+
+
+def test_llm_benchmark_keeps_python_and_cpp_orchestrations_separate() -> None:
+    source = (
+        Path(__file__).parents[1] / "benchmarks" / "llm_inference.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'parser.add_argument("--pure-cpp"' in source
+    assert "--python-coda" not in source
+    assert "coda_cpp_model" not in source
+    assert "cpp_model=cpp_model" in source
+
+
 def test_sve_bf16_wrapper_cross_compiles_to_bfdot(tmp_path) -> None:
     compiler = shutil.which("aarch64-linux-gnu-g++-13") or shutil.which("aarch64-linux-gnu-g++")
     if compiler is None:

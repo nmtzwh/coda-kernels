@@ -41,6 +41,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "prepack_weight",
             &coda::cpu::prepack_weight,
             py::arg("B"));
+    m.def(
+            "execute_aten_vec_gemm",
+            &coda::cpu::execute_aten_vec_gemm,
+            py::arg("A"),
+            py::arg("B"));
+    m.def(
+            "execute_aten_vec_rmsnorm",
+            &coda::cpu::execute_aten_vec_rmsnorm,
+            py::arg("x"),
+            py::arg("w"),
+            py::arg("eps"));
+    m.def(
+            "execute_aten_vec_split_transpose_rope_cache",
+            &coda::cpu::execute_aten_vec_split_transpose_rope_cache,
+            py::arg("qkv"),
+            py::arg("cos"),
+            py::arg("sin"),
+            py::arg("k_cache"),
+            py::arg("v_cache"),
+            py::arg("layer_idx"),
+            py::arg("cache_index"),
+            py::arg("num_heads"),
+            py::arg("num_kv_heads"),
+            py::arg("head_dim"),
+            py::arg("is_qwen3"),
+            py::arg("q_norm_w"),
+            py::arg("k_norm_w"),
+            py::arg("rms_norm_eps"));
+    m.def(
+            "execute_aten_vec_decode_attention",
+            &coda::cpu::execute_aten_vec_decode_attention,
+            py::arg("Q"),
+            py::arg("k_cache"),
+            py::arg("v_cache"),
+            py::arg("layer_idx"),
+            py::arg("seq_len"),
+            py::arg("num_heads"),
+            py::arg("num_kv_heads"),
+            py::arg("head_dim"));
 
     py::class_<coda::cpu::CodaQwenModel>(m, "CodaQwenModel")
         .def(py::init<

@@ -111,6 +111,48 @@ class FusedLayerWeights:
         prepack_weight(self.w2)
         prepack_weight(self.w3)
 
+def _cpu_provider_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from kernels.cpu.providers import select_provider
+
+    if x.shape[-1] != weight.shape[0]:
+        raise ValueError(f"incompatible matmul shapes: {tuple(x.shape)} x {tuple(weight.shape)}")
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    out_2d = select_provider().matmul(x_2d, weight)
+    if x.ndim == 2:
+        return out_2d
+    return out_2d.reshape(*x.shape[:-1], weight.shape[1])
+
+def _get_lm_head_weight(model) -> torch.Tensor:
+    cached = getattr(model, "_coda_lm_head_weight", None)
+    source = model.lm_head.weight
+    if (
+        cached is None
+        or cached.dtype != source.dtype
+        or cached.device != source.device
+        or cached.shape != (source.shape[1], source.shape[0])
+    ):
+        cached = source.mT.contiguous()
+        from kernels.cpu.providers import prepack_weight
+        prepack_weight(cached)
+        setattr(model, "_coda_lm_head_weight", cached)
+    return cached
+
+def _aten_vec_native():
+    from kernels.cpu.native import load_native_extension
+    from kernels.cpu.providers import select_provider
+
+    if select_provider().name != "aten-vec":
+        return None
+    native = load_native_extension()
+    required = (
+        "execute_aten_vec_rmsnorm",
+        "execute_aten_vec_split_transpose_rope_cache",
+        "execute_aten_vec_decode_attention",
+    )
+    if native is None or not all(hasattr(native, name) for name in required):
+        return None
+    return native
+
 def coda_forward(
     model,
     fused_weights,
@@ -123,19 +165,22 @@ def coda_forward(
     num_kv_heads,
     head_dim,
     rms_norm_eps,
-    is_qwen3
+    is_qwen3,
+    lm_head_weight=None,
 ):
     B, T = input_ids.shape
     x = model.model.embed_tokens(input_ids) # shape (B, T, hidden_size)
-    
-    # Pre-unsqueeze cos and sin once outside the layers loop
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
+    native = _aten_vec_native()
+    cos_for_python = cos.unsqueeze(1)
+    sin_for_python = sin.unsqueeze(1)
     
     # Layer 0 Attention input
     l0_weights = fused_weights[0]
-    h = model.model.layers[0].input_layernorm(x)
-    qkv = h.matmul(l0_weights.w3) # shape (B, T, qkv_dim)
+    if native is not None:
+        h = native.execute_aten_vec_rmsnorm(x, l0_weights.wn1, rms_norm_eps)
+    else:
+        h = model.model.layers[0].input_layernorm(x)
+    qkv = _cpu_provider_matmul(h, l0_weights.w3) # shape (B, T, qkv_dim)
     if l0_weights.has_qkv_bias:
         qkv = qkv + l0_weights.qkv_bias
     
@@ -144,35 +189,68 @@ def coda_forward(
     
     for l in range(len(fused_weights)):
         l_weights = fused_weights[l]
-        
-        # Split QKV
-        q, k, v = qkv.split([q_dim, k_dim, k_dim], dim=-1)
-        
-        # Reshape Q, K, V for attention
-        q = q.view(B, T, num_heads, head_dim)
-        k = k.view(B, T, num_kv_heads, head_dim)
-        v = v.view(B, T, num_kv_heads, head_dim)
-        
-        if is_qwen3:
-            q = l_weights.q_norm(q)
-            k = l_weights.k_norm(k)
-            
-        # Transpose for SDPA & RoPE
-        q = q.transpose(1, 2) # (B, num_heads, T, head_dim)
-        k = k.transpose(1, 2) # (B, num_kv_heads, T, head_dim)
-        v = v.transpose(1, 2) # (B, num_kv_heads, T, head_dim)
-        
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        
-        if past_key_values is not None:
-            past_key_values.update(k, v, l)
+
+        if native is not None and past_key_values is not None:
+            q_norm_w = l_weights.q_norm.weight if is_qwen3 else qkv.new_empty((0,))
+            k_norm_w = l_weights.k_norm.weight if is_qwen3 else qkv.new_empty((0,))
+            q = native.execute_aten_vec_split_transpose_rope_cache(
+                qkv,
+                cos,
+                sin,
+                past_key_values.k_cache,
+                past_key_values.v_cache,
+                l,
+                past_key_values.seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                is_qwen3,
+                q_norm_w,
+                k_norm_w,
+                rms_norm_eps,
+            )
             k_full = past_key_values.get_k(l, T)
             v_full = past_key_values.get_v(l, T)
         else:
-            k_full = k
-            v_full = v
+            # Split QKV
+            q, k, v = qkv.split([q_dim, k_dim, k_dim], dim=-1)
+
+            # Reshape Q, K, V for attention
+            q = q.view(B, T, num_heads, head_dim)
+            k = k.view(B, T, num_kv_heads, head_dim)
+            v = v.view(B, T, num_kv_heads, head_dim)
+
+            if is_qwen3:
+                q = l_weights.q_norm(q)
+                k = l_weights.k_norm(k)
+
+            # Transpose for SDPA & RoPE
+            q = q.transpose(1, 2) # (B, num_heads, T, head_dim)
+            k = k.transpose(1, 2) # (B, num_kv_heads, T, head_dim)
+            v = v.transpose(1, 2) # (B, num_kv_heads, T, head_dim)
+
+            q, k = apply_rotary_pos_emb(q, k, cos_for_python, sin_for_python)
+
+            if past_key_values is not None:
+                past_key_values.update(k, v, l)
+                k_full = past_key_values.get_k(l, T)
+                v_full = past_key_values.get_v(l, T)
+            else:
+                k_full = k
+                v_full = v
             
-        if num_heads != num_kv_heads:
+        if native is not None and past_key_values is not None and T == 1:
+            attn_out = native.execute_aten_vec_decode_attention(
+                q,
+                past_key_values.k_cache,
+                past_key_values.v_cache,
+                l,
+                past_key_values.seq_len + 1,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            )
+        elif num_heads != num_kv_heads:
             # 5D broadcasting for GQA to avoid repeat_kv memory copy
             q_5d = q.view(B, num_kv_heads, num_heads // num_kv_heads, T, head_dim)
             k_5d = k_full.unsqueeze(2) # (B, num_kv_heads, 1, T_seq, head_dim)
@@ -181,11 +259,12 @@ def coda_forward(
                 q_5d, k_5d, v_5d, is_causal=(T > 1)
             )
             attn_out = attn_out.view(B, num_heads, T, head_dim)
+            attn_out = attn_out.transpose(1, 2).reshape(B, T, -1).contiguous()
         else:
             attn_out = torch.nn.functional.scaled_dot_product_attention(
                 q, k_full, v_full, is_causal=(T > 1)
             )
-        attn_out = attn_out.transpose(1, 2).reshape(B, T, -1).contiguous()
+            attn_out = attn_out.transpose(1, 2).reshape(B, T, -1).contiguous()
         
         # Fused MLP input block
         x_mlp_res, y_swiglu, _, _ = gemm_residual_rmsnorm_gemm_fwd(
@@ -226,9 +305,14 @@ def coda_forward(
                 qkv = qkv + next_l_weights.qkv_bias
         else:
             # Last layer post-MLP down-proj & final norm
-            x_final = x_mlp_res + y_swiglu.matmul(l_weights.w2)
-            h_final = model.model.norm(x_final)
-            logits = model.lm_head(h_final)
+            x_final = x_mlp_res + _cpu_provider_matmul(y_swiglu, l_weights.w2)
+            if native is not None:
+                h_final = native.execute_aten_vec_rmsnorm(x_final, model.model.norm.weight, rms_norm_eps)
+            else:
+                h_final = model.model.norm(x_final)
+            if lm_head_weight is None:
+                lm_head_weight = _get_lm_head_weight(model)
+            logits = _cpu_provider_matmul(h_final, lm_head_weight)
             
     if past_key_values is not None:
         past_key_values.increment_seq_len(T)
@@ -243,7 +327,8 @@ def run_decode_loop(
     is_qwen3,
     config,
     use_coda=True,
-    cpp_model=None
+    cpp_model=None,
+    lm_head_weight=None,
 ):
     B, T = input_ids.shape
     device = input_ids.device
@@ -312,7 +397,8 @@ def run_decode_loop(
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
-            is_qwen3=is_qwen3
+            is_qwen3=is_qwen3,
+            lm_head_weight=lm_head_weight,
         )
     else:
         # Standard PyTorch model forward with HF Cache
@@ -365,7 +451,8 @@ def run_decode_loop(
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 rms_norm_eps=rms_norm_eps,
-                is_qwen3=is_qwen3
+                is_qwen3=is_qwen3,
+                lm_head_weight=lm_head_weight,
             )
         else:
             outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
@@ -414,7 +501,7 @@ def make_cpp_model(model, fused_weights, config, is_qwen3):
         k_norm_weights = [torch.empty((0,), dtype=embed_tokens_weight.dtype) for _ in fused_weights]
         
     final_norm_weight = model.model.norm.weight
-    lm_head_weight = model.lm_head.weight.t().contiguous()
+    lm_head_weight = _get_lm_head_weight(model)
     
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
@@ -475,11 +562,12 @@ def main():
         FusedLayerWeights(layer, is_qwen3=is_qwen3)
         for layer in model.model.layers
     ]
+    lm_head_weight = _get_lm_head_weight(model)
     
     input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids
     print(f"Prompt tokens: {input_ids.shape[1]}")
-    
-    # Construct C++ CodaQwenModel if requested
+
+    # Construct C++ CodaQwenModel if requested.
     cpp_model = None
     if args.pure_cpp:
         print("Constructing C++ CodaQwenModel...")
@@ -509,7 +597,8 @@ def main():
         max_new_tokens=args.gen_len,
         is_qwen3=is_qwen3,
         config=config,
-        use_coda=True
+        use_coda=True,
+        lm_head_weight=lm_head_weight,
     )
     
     ref_text = tokenizer.decode(ref_tokens[0], skip_special_tokens=True)
@@ -531,7 +620,8 @@ def main():
             max_new_tokens=args.gen_len,
             is_qwen3=is_qwen3,
             config=config,
-            cpp_model=cpp_model
+            cpp_model=cpp_model,
+            lm_head_weight=lm_head_weight,
         )
         cpp_text = tokenizer.decode(cpp_tokens[0], skip_special_tokens=True)
         print(f"cpu/pure-cpp generated tokens: {cpp_tokens[0].tolist()}")
@@ -566,7 +656,8 @@ def main():
         max_new_tokens=args.gen_len,
         is_qwen3=is_qwen3,
         config=config,
-        use_coda=True
+        use_coda=True,
+        lm_head_weight=lm_head_weight,
     )
     
     _, pref_coda, dec_coda = run_decode_loop(
@@ -576,7 +667,8 @@ def main():
         max_new_tokens=args.gen_len,
         is_qwen3=is_qwen3,
         config=config,
-        use_coda=True
+        use_coda=True,
+        lm_head_weight=lm_head_weight,
     )
     print(f"cpu/aten-vec:")
     print(f"  Prefill: elapsed={pref_coda:.3f} s, throughput={prompt_len / pref_coda:.2f} tok/s")
@@ -592,7 +684,8 @@ def main():
             max_new_tokens=args.gen_len,
             is_qwen3=is_qwen3,
             config=config,
-            cpp_model=cpp_model
+            cpp_model=cpp_model,
+            lm_head_weight=lm_head_weight,
         )
         
         _, pref_cpp, dec_cpp = run_decode_loop(
@@ -602,7 +695,8 @@ def main():
             max_new_tokens=args.gen_len,
             is_qwen3=is_qwen3,
             config=config,
-            cpp_model=cpp_model
+            cpp_model=cpp_model,
+            lm_head_weight=lm_head_weight,
         )
         print(f"cpu/pure-cpp:")
         print(f"  Prefill: elapsed={pref_cpp:.3f} s, throughput={prompt_len / pref_cpp:.2f} tok/s")

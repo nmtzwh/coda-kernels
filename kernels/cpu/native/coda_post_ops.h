@@ -56,6 +56,35 @@ bool has_aten_vec();
 std::string aten_vec_isa();
 bool aten_vec_bf16_dot();
 void prepack_weight(const at::Tensor &B);
+at::Tensor execute_aten_vec_gemm(const at::Tensor &A, const at::Tensor &B);
+at::Tensor execute_aten_vec_rmsnorm(
+        const at::Tensor &x,
+        const at::Tensor &w,
+        double eps);
+at::Tensor execute_aten_vec_split_transpose_rope_cache(
+        const at::Tensor &qkv,
+        const at::Tensor &cos,
+        const at::Tensor &sin,
+        at::Tensor &k_cache,
+        at::Tensor &v_cache,
+        int64_t layer_idx,
+        int64_t cache_index,
+        int64_t num_heads,
+        int64_t num_kv_heads,
+        int64_t head_dim,
+        bool is_qwen3,
+        const at::Tensor &q_norm_w,
+        const at::Tensor &k_norm_w,
+        double rms_norm_eps);
+at::Tensor execute_aten_vec_decode_attention(
+        const at::Tensor &Q,
+        const at::Tensor &k_cache,
+        const at::Tensor &v_cache,
+        int64_t layer_idx,
+        int64_t seq_len,
+        int64_t num_heads,
+        int64_t num_kv_heads,
+        int64_t head_dim);
 
 std::pair<at::Tensor, pybind11::dict> execute_brgemm_postops(
         const std::string &program_name,

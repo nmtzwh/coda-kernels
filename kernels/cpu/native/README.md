@@ -54,6 +54,15 @@ around `svbfdot_f32` for the inner dot product. The wrapper requires
 `-march=armv8.6-a+sve2+bf16 -msve-vector-bits=256`; unsupported AArch64 builds
 continue to use the existing fp32-promoted ATen `fmadd` path.
 
+The LLM inference benchmark keeps `cpu/aten-vec` and `cpu/pure-cpp` as separate
+orchestrations. `cpu/aten-vec` dispatches kernels from Python, while
+`cpu/pure-cpp` dispatches the same aten-vec building blocks inside
+`CodaQwenModel`. The Python path routes standalone RMSNorm, QKV split/RoPE/cache
+update, one-token decode attention, and loose QKV/down-projection/LM-head GEMMs
+through native aten-vec helpers. This keeps the benchmark focused on Python
+kernel dispatch overhead instead of accidentally comparing different kernel
+sets or decode-sized `aten::mm` on AArch64.
+
 PyTorch 2.12 native extensions require C++20 headers. On older POSIX compilers
 that implement C++20 under `-std=c++2a`, the loader creates a temporary
 compatibility wrapper that translates PyTorch's `-std=c++20` flag. Optional
