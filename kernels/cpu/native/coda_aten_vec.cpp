@@ -1984,6 +1984,15 @@ std::string aten_vec_isa() {
 #endif
 }
 
+bool aten_vec_bf16_dot() {
+#if defined(CODA_CPU_WITH_ATEN_VEC) && \
+        (defined(__AVX512BF16__) || defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16))
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::pair<at::Tensor, py::dict> execute_aten_vec_postops(
         const std::string &program_name,
         const py::list &nodes,
@@ -2379,7 +2388,7 @@ at::Tensor coda_qwen_forward_template(
     auto h = apply_rmsnorm<T>(x, input_norm_w, model.rms_norm_eps);
     auto w3 = model.w3_weights[0];
     auto h_2d = h.reshape({B * T_seq, -1});
-    auto qkv_2d = at::matmul(h_2d, w3);
+    auto qkv_2d = execute_gemm_pure<T>(h_2d, w3);
     if (model.qkv_biases[0].defined() && model.qkv_biases[0].numel() > 0) {
         qkv_2d.add_(model.qkv_biases[0]);
     }
@@ -2448,11 +2457,11 @@ at::Tensor coda_qwen_forward_template(
             x_current = x_next_2d.reshape({B, T_seq, -1});
         } else {
             auto w2 = model.w2_weights[l];
-            auto x_final_2d = x_mlp_res_2d + at::matmul(y_swiglu_2d, w2);
+            auto x_final_2d = x_mlp_res_2d + execute_gemm_pure<T>(y_swiglu_2d, w2);
             auto x_final = x_final_2d.reshape({B, T_seq, -1});
             auto h_final = apply_rmsnorm<T>(x_final, model.final_norm_weight, model.rms_norm_eps);
             auto h_final_2d = h_final.reshape({B * T_seq, -1});
-            auto logits_2d = at::matmul(h_final_2d, model.lm_head_weight);
+            auto logits_2d = execute_gemm_pure<T>(h_final_2d, model.lm_head_weight);
             auto logits = logits_2d.reshape({B, T_seq, -1});
             return logits;
         }

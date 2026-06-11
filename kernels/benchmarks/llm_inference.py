@@ -385,6 +385,9 @@ def make_cpp_model(model, fused_weights, config, is_qwen3):
     if native is None or not hasattr(native, "CodaQwenModel"):
         print("CodaQwenModel not available in native extension.")
         return None
+    if hasattr(native, "aten_vec_isa"):
+        bf16_dot = native.aten_vec_bf16_dot() if hasattr(native, "aten_vec_bf16_dot") else False
+        print(f"Native aten-vec ISA: {native.aten_vec_isa()} (bf16 dot={bf16_dot})")
     
     # Extract weights
     embed_tokens_weight = model.model.embed_tokens.weight

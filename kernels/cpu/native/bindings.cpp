@@ -12,6 +12,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("has_libxsmm", &coda::cpu::has_libxsmm);
     m.def("has_aten_vec", &coda::cpu::has_aten_vec);
     m.def("aten_vec_isa", &coda::cpu::aten_vec_isa);
+    m.def("aten_vec_bf16_dot", &coda::cpu::aten_vec_bf16_dot);
     m.def(
             "execute_brgemm_postops",
             &coda::cpu::execute_brgemm_postops,
@@ -88,4 +89,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("cache_index")
         );
 }
-

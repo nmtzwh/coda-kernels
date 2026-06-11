@@ -164,6 +164,19 @@ def test_sve_bf16_intrinsics_are_isolated_to_wrapper() -> None:
     assert "svbfdot_f32" in wrapper
 
 
+def test_cpp_decode_projection_path_uses_aten_vec_gemm() -> None:
+    source = (
+        Path(__file__).parents[1] / "cpu" / "native" / "coda_aten_vec.cpp"
+    ).read_text(encoding="utf-8")
+    start = source.index("at::Tensor coda_qwen_forward_template")
+    end = source.index("CodaQwenModel::CodaQwenModel")
+    forward_source = source[start:end]
+
+    assert "at::matmul" not in forward_source
+    assert "auto qkv_2d = execute_gemm_pure<T>(h_2d, w3);" in forward_source
+    assert "auto logits_2d = execute_gemm_pure<T>(h_final_2d, model.lm_head_weight);" in forward_source
+
+
 def test_sve_bf16_wrapper_cross_compiles_to_bfdot(tmp_path) -> None:
     compiler = shutil.which("aarch64-linux-gnu-g++-13") or shutil.which("aarch64-linux-gnu-g++")
     if compiler is None:
