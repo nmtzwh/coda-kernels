@@ -226,8 +226,31 @@ def _supports_sve256() -> bool:
     return "SVE256" in _torch_cpu_capability()
 
 
+@lru_cache(maxsize=1)
+def _cpu_flags() -> frozenset[str]:
+    if os.name != "posix":
+        return frozenset()
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return frozenset()
+
+    flags: set[str] = set()
+    for line in cpuinfo.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() in {"flags", "features"}:
+            flags.update(value.lower().split())
+    return frozenset(flags)
+
+
+def _supports_sve2_bf16() -> bool:
+    flags = _cpu_flags()
+    has_sve_bf16 = "svebf16" in flags or "bf16" in flags
+    return _supports_sve256() and "sve2" in flags and has_sve_bf16
+
+
 def _select_aten_vec_isa(requested_isa: str) -> str:
-    if requested_isa not in {"auto", "generic", "avx2", "avx512", "sve256"}:
+    if requested_isa not in {"auto", "generic", "avx2", "avx512", "sve256", "sve2-bf16"}:
         raise ValueError(f"unknown CODA_CPU_ATEN_VEC_ISA={requested_isa!r}")
     if requested_isa != "auto":
         return requested_isa
@@ -235,6 +258,8 @@ def _select_aten_vec_isa(requested_isa: str) -> str:
         return "avx512"
     if _supports_avx2():
         return "avx2"
+    if _supports_sve2_bf16():
+        return "sve2-bf16"
     if _supports_sve256():
         return "sve256"
     return "generic"
@@ -296,6 +321,20 @@ def _aten_vec_cflags() -> list[str]:
             "-DCODA_CPU_ATEN_VEC_ISA_SVE256=1",
             "-DAT_BUILD_ARM_VEC256_WITH_SLEEF=1",
             "-march=armv8-a+sve+bf16",
+            "-msve-vector-bits=256",
+        ]
+
+    if selected_isa == "sve2-bf16":
+        if os.name == "nt":
+            raise ValueError("CODA_CPU_ATEN_VEC_ISA=sve2-bf16 requires a POSIX AArch64 toolchain")
+        return [
+            "-DCODA_CPU_WITH_ATEN_VEC=1",
+            "-DCPU_CAPABILITY=SVE",
+            "-DCPU_CAPABILITY_SVE=1",
+            "-DCPU_CAPABILITY_SVE256=1",
+            "-DCODA_CPU_ATEN_VEC_ISA_SVE2_BF16=1",
+            "-DAT_BUILD_ARM_VEC256_WITH_SLEEF=1",
+            "-march=armv8.6-a+sve2+bf16",
             "-msve-vector-bits=256",
         ]
 

@@ -35,16 +35,24 @@ epilogues first. Unsupported dtype/layout cases fall back to the Python ATen
 provider unless `CODA_ATEN_VEC_STRICT=1` is set. Set
 `CODA_CPU_ATEN_VEC_ISA=generic` to use the platform baseline,
 `CODA_CPU_ATEN_VEC_ISA=avx2` or `avx512` on x86, or
-`CODA_CPU_ATEN_VEC_ISA=sve256` on AArch64. Auto-selection prefers AVX512 over
-AVX2 and selects SVE256 only when PyTorch reports `SVE256`; otherwise AArch64
-uses the generic 128-bit NEON implementation. PyTorch 2.12 exposes a fixed
-SVE256 ATen-vector specialization, so other SVE vector lengths use NEON here.
+`CODA_CPU_ATEN_VEC_ISA=sve256` / `sve2-bf16` on AArch64. Auto-selection prefers
+AVX512 over AVX2, then selects `sve2-bf16` when PyTorch reports `SVE256` and
+Linux CPU features report SVE BF16 support; otherwise it selects plain SVE256
+only when PyTorch reports `SVE256`. AArch64 without fixed SVE256 uses the
+generic 128-bit NEON implementation. PyTorch 2.12 exposes a fixed SVE256
+ATen-vector specialization, so other SVE vector lengths use NEON here.
 The GEMM loop packs RHS register panels, keeps `Kc x Nr` in 80% of L1D, keeps
 the active LHS `Mc x K` panel in 75% of L2, and uses named `4 x (3 * vector
 length)` ATen-vector register tiles before applying vectorized transformer epilogues. Cache sizes
 and the ATen parallel backend are detected from the installed PyTorch 2.12 CPU
 wheel. OpenMP wheels compile and link the extension with OpenMP; native-thread-
 pool wheels use ATen's native parallel backend.
+
+For AArch64 bfloat16 GEMM, `sve2-bf16` keeps the same ATen-vector epilogue path
+but stores packed RHS panels as bfloat16 and uses an isolated SVE BF16 wrapper
+around `svbfdot_f32` for the inner dot product. The wrapper requires
+`-march=armv8.6-a+sve2+bf16 -msve-vector-bits=256`; unsupported AArch64 builds
+continue to use the existing fp32-promoted ATen `fmadd` path.
 
 PyTorch 2.12 native extensions require C++20 headers. On older POSIX compilers
 that implement C++20 under `-std=c++2a`, the loader creates a temporary
@@ -105,3 +113,23 @@ CODA_CPU_JIT_BUILD=1 CODA_CPU_WITH_ATEN_VEC=1 CODA_CPU_PROVIDER=aten-vec pytest 
 CODA_CPU_JIT_BUILD=1 CODA_CPU_WITH_ATEN_VEC=1 python -m kernels.benchmarks.cpu_transformer --threads 8
 CODA_CPU_JIT_BUILD=1 CODA_CPU_WITH_LIBXSMM=1 pytest kernels/tests/test_cpu_gpt.py -q
 ```
+
+On non-AArch64 hosts, the SVE BF16 intrinsic wrapper can still be codegen-checked
+with an installed cross compiler:
+
+```bash
+pytest kernels/tests/test_cpu_portability.py -q -k sve_bf16
+```
+
+For correctness, run the native extension in an AArch64 Python + PyTorch 2.12
+environment under QEMU:
+
+```bash
+qemu-aarch64 -L /path/to/aarch64/sysroot -cpu max,sve=on,sve256=on \
+  /path/to/aarch64/python -m pytest kernels/tests/test_cpu_gpt.py -q
+```
+
+Set `CODA_CPU_JIT_BUILD=1`, `CODA_CPU_WITH_ATEN_VEC=1`,
+`CODA_CPU_ATEN_VEC_ISA=sve2-bf16`, and `CODA_CPU_PROVIDER=aten-vec` for that
+QEMU run. QEMU is intended for correctness and instruction coverage only, not
+performance measurement.

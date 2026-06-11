@@ -1,4 +1,6 @@
 import argparse
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -88,6 +90,7 @@ def test_native_provider_architecture_gates_include_supported_aarch64(monkeypatc
 def test_aten_vec_auto_isa_prefers_widest_supported_specialization(monkeypatch) -> None:
     monkeypatch.setattr(native, "_supports_avx512", lambda: True)
     monkeypatch.setattr(native, "_supports_avx2", lambda: True)
+    monkeypatch.setattr(native, "_supports_sve2_bf16", lambda: False)
     monkeypatch.setattr(native, "_supports_sve256", lambda: False)
     assert native._select_aten_vec_isa("auto") == "avx512"
 
@@ -95,11 +98,45 @@ def test_aten_vec_auto_isa_prefers_widest_supported_specialization(monkeypatch) 
     assert native._select_aten_vec_isa("auto") == "avx2"
 
     monkeypatch.setattr(native, "_supports_avx2", lambda: False)
+    monkeypatch.setattr(native, "_supports_sve2_bf16", lambda: True)
+    monkeypatch.setattr(native, "_supports_sve256", lambda: True)
+    assert native._select_aten_vec_isa("auto") == "sve2-bf16"
+
+    monkeypatch.setattr(native, "_supports_sve2_bf16", lambda: False)
     monkeypatch.setattr(native, "_supports_sve256", lambda: True)
     assert native._select_aten_vec_isa("auto") == "sve256"
 
     monkeypatch.setattr(native, "_supports_sve256", lambda: False)
     assert native._select_aten_vec_isa("auto") == "generic"
+
+    assert native._select_aten_vec_isa("sve2-bf16") == "sve2-bf16"
+
+
+def test_aten_vec_sve2_bf16_feature_detection(monkeypatch) -> None:
+    monkeypatch.setattr(native, "_supports_sve256", lambda: True)
+    monkeypatch.setattr(native, "_cpu_flags", lambda: frozenset({"sve", "sve2", "bf16"}))
+    assert native._supports_sve2_bf16()
+
+    monkeypatch.setattr(native, "_cpu_flags", lambda: frozenset({"sve", "sve2"}))
+    assert not native._supports_sve2_bf16()
+
+    monkeypatch.setattr(native, "_cpu_flags", lambda: frozenset({"sve", "sve2", "svebf16"}))
+    assert native._supports_sve2_bf16()
+
+    monkeypatch.setattr(native, "_cpu_flags", lambda: frozenset({"sve", "svebf16"}))
+    assert not native._supports_sve2_bf16()
+
+    monkeypatch.setattr(native, "_supports_sve256", lambda: False)
+    assert not native._supports_sve2_bf16()
+
+
+def test_aten_vec_sve2_bf16_cflags(monkeypatch) -> None:
+    monkeypatch.setenv("CODA_CPU_ATEN_VEC_ISA", "sve2-bf16")
+    flags = native._aten_vec_cflags()
+    assert "-DCODA_CPU_ATEN_VEC_ISA_SVE2_BF16=1" in flags
+    assert "-DCPU_CAPABILITY_SVE256=1" in flags
+    assert "-march=armv8.6-a+sve2+bf16" in flags
+    assert "-msve-vector-bits=256" in flags
 
 
 def test_aten_vec_kernel_uses_generic_aten_vector_api() -> None:
@@ -109,10 +146,63 @@ def test_aten_vec_kernel_uses_generic_aten_vector_api() -> None:
     assert "<ATen/cpu/vec/vec.h>" in source
     assert "at::vec::Vectorized<float>" in source
     for architecture_specific_token in (
-        "<immintrin.h>",
         "<arm_neon.h>",
-        "_mm256",
-        "_mm512",
         "svfloat",
+        "svbfdot",
     ):
         assert architecture_specific_token not in source
+
+
+def test_sve_bf16_intrinsics_are_isolated_to_wrapper() -> None:
+    native_dir = Path(__file__).parents[1] / "cpu" / "native"
+    source = (native_dir / "coda_aten_vec.cpp").read_text(encoding="utf-8")
+    wrapper = (native_dir / "coda_aten_vec_sve_bf16.h").read_text(encoding="utf-8")
+
+    assert "<arm_sve.h>" not in source
+    assert "svbfdot_f32" not in source
+    assert "<arm_sve.h>" in wrapper
+    assert "svbfdot_f32" in wrapper
+
+
+def test_sve_bf16_wrapper_cross_compiles_to_bfdot(tmp_path) -> None:
+    compiler = shutil.which("aarch64-linux-gnu-g++-13") or shutil.which("aarch64-linux-gnu-g++")
+    if compiler is None:
+        pytest.skip("AArch64 cross compiler is not available")
+
+    native_dir = Path(__file__).parents[1] / "cpu" / "native"
+    source = tmp_path / "probe.cpp"
+    asm = tmp_path / "probe.s"
+    source.write_text(
+        f"""
+#include "{native_dir / 'coda_aten_vec_sve_bf16.h'}"
+
+struct DummyBFloat16 {{
+    unsigned short x;
+}};
+
+extern "C" void probe(const DummyBFloat16 *A, const DummyBFloat16 *B, float *C) {{
+    coda::cpu::aten_vec_sve_bf16::gemm_microkernel<DummyBFloat16, 1, 1, false>(
+            A, B, C, 2, 8, 0, 2);
+}}
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++20",
+            "-O3",
+            "-march=armv8.6-a+sve2+bf16",
+            "-msve-vector-bits=256",
+            "-S",
+            str(source),
+            "-o",
+            str(asm),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "bfdot" in asm.read_text(encoding="utf-8")

@@ -17,6 +17,9 @@
 #if defined(CODA_CPU_WITH_ATEN_VEC)
 #include <ATen/cpu/vec/vec.h>
 #include <ATen/cpu/vec/functional.h>
+#if defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16)
+#include "coda_aten_vec_sve_bf16.h"
+#endif
 #endif
 
 namespace py = pybind11;
@@ -124,7 +127,7 @@ struct PackedBType {
     using type = float;
 };
 
-#if defined(__AVX512BF16__)
+#if defined(__AVX512BF16__) || defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16)
 template <>
 struct PackedBType<c10::BFloat16> {
     using type = c10::BFloat16;
@@ -493,8 +496,12 @@ inline void gemm_microkernel_4x2(
         c21 = Vec(c21_v);
         c30 = Vec(c30_v);
         c31 = Vec(c31_v);
+#elif defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16)
+        aten_vec_sve_bf16::gemm_microkernel<T, 4, 2, accumulate>(
+                a_base, b_panel, acc_base, K, block_n, k_begin, k_end);
+        return;
 #else
-        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 or AArch64 SVE BF16 support");
 #endif
     } else {
         int64_t k = k_begin;
@@ -709,8 +716,12 @@ inline void gemm_microkernel_4x3(
         c30 = Vec(c30_v);
         c31 = Vec(c31_v);
         c32 = Vec(c32_v);
+#elif defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16)
+        aten_vec_sve_bf16::gemm_microkernel<T, 4, 3, accumulate>(
+                a_base, b_panel, acc_base, K, block_n, k_begin, k_end);
+        return;
 #else
-        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 or AArch64 SVE BF16 support");
 #endif
     } else {
         int64_t k = k_begin;
@@ -1029,8 +1040,12 @@ inline void gemm_microkernel_4x4(
         c31 = Vec(c31_v);
         c32 = Vec(c32_v);
         c33 = Vec(c33_v);
+#elif defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16)
+        aten_vec_sve_bf16::gemm_microkernel<T, 4, 4, accumulate>(
+                a_base, b_panel, acc_base, K, block_n, k_begin, k_end);
+        return;
 #else
-        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 or AArch64 SVE BF16 support");
 #endif
     } else {
         int64_t k = k_begin;
@@ -1196,8 +1211,12 @@ inline void gemm_microkernel(
         static_for<0, num_acc>([&](auto index) {
             acc[index] = Vec(acc_v[index]);
         });
+#elif defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16)
+        aten_vec_sve_bf16::gemm_microkernel<T, rows, col_vectors, accumulate>(
+                a_base, b_panel, acc_base, K, block_n, k_begin, k_end);
+        return;
 #else
-        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 support");
+        TORCH_CHECK(false, "BFloat16 packed GEMM requires AVX512_BF16 or AArch64 SVE BF16 support");
 #endif
     } else {
         for (int64_t k = k_begin; k < k_end; ++k) {
@@ -1950,6 +1969,8 @@ std::string aten_vec_isa() {
     return "avx512";
 #elif defined(CODA_CPU_ATEN_VEC_ISA_AVX2)
     return "avx2";
+#elif defined(CODA_CPU_ATEN_VEC_ISA_SVE2_BF16)
+    return "sve2-bf16";
 #elif defined(CODA_CPU_ATEN_VEC_ISA_SVE256)
     return "sve256";
 #elif defined(CODA_CPU_ATEN_VEC_ISA_GENERIC)
@@ -2512,4 +2533,3 @@ at::Tensor CodaQwenModel::forward(
 }
 
 }  // namespace coda::cpu
-
