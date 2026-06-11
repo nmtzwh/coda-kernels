@@ -54,6 +54,70 @@ around `svbfdot_f32` for the inner dot product. The wrapper requires
 `-march=armv8.6-a+sve2+bf16 -msve-vector-bits=256`; unsupported AArch64 builds
 continue to use the existing fp32-promoted ATen `fmadd` path.
 
+## AArch64 SVE/SVE2 BF16 Build
+
+Run the following commands from the repository root on the AArch64 machine. The
+`sve2-bf16` build requires a compiler that accepts
+`-march=armv8.6-a+sve2+bf16` and a PyTorch CPU build whose ATen headers include
+the fixed SVE256 vector path.
+
+First confirm the machine and PyTorch CPU capability:
+
+```bash
+python - <<'PY'
+import platform
+import torch
+
+print("machine:", platform.machine())
+print("torch:", torch.__version__)
+print("torch cpu capability:", torch.backends.cpu.get_cpu_capability())
+with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as cpuinfo:
+    for line in cpuinfo:
+        if line.lower().startswith("features"):
+            print(line.strip())
+            break
+PY
+```
+
+For the BFDOT path, expect `machine: aarch64`, PyTorch CPU capability containing
+`SVE256`, and Linux CPU features containing `sve`, `sve2`, and either `bf16` or
+`svebf16`.
+
+Build and probe the ATen-vector native extension:
+
+```bash
+export CODA_CPU_JIT_BUILD=1
+export CODA_CPU_WITH_ATEN_VEC=1
+export CODA_CPU_PROVIDER=aten-vec
+export CODA_CPU_ATEN_VEC_ISA=sve2-bf16
+export CODA_CPU_JIT_VERBOSE=1
+
+# Use a fresh extension directory when changing ISA or compiler flags.
+export TORCH_EXTENSIONS_DIR=/tmp/coda-torch-extensions-sve2-bf16
+
+python - <<'PY'
+from kernels.cpu.native import load_native_extension
+
+n = load_native_extension()
+assert n is not None, "native extension did not build or load"
+assert n.has_aten_vec(), "aten-vec was not compiled into the native extension"
+print("aten-vec isa:", n.aten_vec_isa())
+print("bf16 dot:", n.aten_vec_bf16_dot())
+PY
+```
+
+For an SVE2 BF16 system, the probe should print:
+
+```text
+aten-vec isa: sve2-bf16
+bf16 dot: True
+```
+
+If the machine has SVE256 but not SVE2 BF16, use
+`CODA_CPU_ATEN_VEC_ISA=sve256`. If auto-detection is preferred, omit
+`CODA_CPU_ATEN_VEC_ISA`; auto chooses `sve2-bf16` only when PyTorch reports
+`SVE256` and `/proc/cpuinfo` advertises SVE2 BF16.
+
 The LLM inference benchmark keeps `cpu/aten-vec` and `cpu/pure-cpp` as separate
 orchestrations. `cpu/aten-vec` dispatches kernels from Python, while
 `cpu/pure-cpp` dispatches the same aten-vec building blocks inside
@@ -62,6 +126,165 @@ update, one-token decode attention, and loose QKV/down-projection/LM-head GEMMs
 through native aten-vec helpers. This keeps the benchmark focused on Python
 kernel dispatch overhead instead of accidentally comparing different kernel
 sets or decode-sized `aten::mm` on AArch64.
+
+## AArch64 LLM Inference Benchmark
+
+Use the same native-extension environment as the build probe. Set the PyTorch
+thread count explicitly; `OMP_PLACES=cores` and `OMP_PROC_BIND=close` are also
+set by the benchmark script if they are not already present.
+
+```bash
+export CODA_CPU_JIT_BUILD=1
+export CODA_CPU_WITH_ATEN_VEC=1
+export CODA_CPU_PROVIDER=aten-vec
+export CODA_CPU_ATEN_VEC_ISA=sve2-bf16
+export TORCH_EXTENSIONS_DIR=/tmp/coda-torch-extensions-sve2-bf16
+
+export OMP_NUM_THREADS=8
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
+
+python -m kernels.benchmarks.llm_inference \
+  --model-path /path/to/hf/model/snapshot \
+  --dtype bfloat16 \
+  --threads "${OMP_NUM_THREADS}" \
+  --gen-len 64 \
+  --pure-cpp \
+  --skip-compiled
+```
+
+The benchmark reports three relevant lines:
+
+```text
+torch/native
+cpu/aten-vec
+cpu/pure-cpp
+```
+
+`cpu/aten-vec` is the Python orchestration path. It dispatches the aten-vec
+kernels one by one from Python. `cpu/pure-cpp` is the C++ orchestration path. It
+uses the same aten-vec small GEMM, RMSNorm, split/RoPE/cache, and decode
+attention kernels inside `CodaQwenModel`. The decode-throughput gap between
+these two lines is therefore intended to show Python kernel-dispatch overhead,
+not different math kernels.
+
+Benchmark both precisions before attributing an issue to BF16:
+
+```bash
+for dtype in float32 bfloat16; do
+  python -m kernels.benchmarks.llm_inference \
+    --model-path /path/to/hf/model/snapshot \
+    --dtype "${dtype}" \
+    --threads "${OMP_NUM_THREADS}" \
+    --gen-len 64 \
+    --pure-cpp \
+    --skip-compiled
+done
+```
+
+When using `bfloat16`, always check the build probe first. If it does not report
+`aten-vec isa: sve2-bf16` and `bf16 dot: True`, the benchmark is not using the
+SVE BFDOT path. Common causes are a stale `TORCH_EXTENSIONS_DIR`, a missing
+`CODA_CPU_ATEN_VEC_ISA=sve2-bf16`, a PyTorch CPU build without `SVE256`, or a
+machine whose `/proc/cpuinfo` lacks SVE2 BF16 features.
+
+## Tracing Torch Eager Linear/Matmul On AArch64
+
+Use this when the `torch/native` baseline calls a oneDNN reference matmul
+implementation instead of an Arm Compute Library implementation.
+
+For normal dense tensors, the expected eager call chain is:
+
+```text
+torch.nn.Linear / torch.nn.functional.linear
+  -> torch._C._nn.linear
+  -> at::native::linear
+  -> at::addmm for 2D input with bias, or at::matmul/at::mm without bias
+  -> CPU addmm/mm implementation
+  -> oneDNN primitive selection when PyTorch routes the shape/dtype to oneDNN
+```
+
+`torch.matmul` with two 2D tensors skips `linear` and reaches `aten::mm`
+directly. `torch.addmm` reaches `aten::addmm` directly.
+
+The helper script below prints the Python-visible ATen operators and enables
+oneDNN verbose before importing Torch:
+
+```bash
+ONEDNN_VERBOSE=all DNNL_VERBOSE=1 \
+python -m kernels.benchmarks.trace_torch_eager_linear \
+  --op linear \
+  --dtype bfloat16 \
+  --m 1 \
+  --k 2048 \
+  --n 8192 \
+  --threads 1
+```
+
+Run the same shape through each eager entry point:
+
+```bash
+for op in linear addmm mm; do
+  ONEDNN_VERBOSE=all DNNL_VERBOSE=1 \
+  python -m kernels.benchmarks.trace_torch_eager_linear \
+    --op "${op}" \
+    --dtype bfloat16 \
+    --m 1 \
+    --k 2048 \
+    --n 8192 \
+    --threads 1
+done
+```
+
+The `ATen:` lines show whether eager reached `aten.linear`, `aten.addmm`, or
+`aten.mm`. The oneDNN verbose lines show the primitive implementation. A
+reference implementation usually appears with an implementation name containing
+`ref`. An ACL implementation usually contains `acl` in the implementation name.
+
+Compare against PyTorch's non-mkldnn fallback:
+
+```bash
+python -m kernels.benchmarks.trace_torch_eager_linear \
+  --op linear \
+  --dtype bfloat16 \
+  --m 1 \
+  --k 2048 \
+  --n 8192 \
+  --threads 1 \
+  --disable-mkldnn
+```
+
+If `--disable-mkldnn` is faster than the oneDNN reference primitive, the issue is
+inside oneDNN primitive selection or oneDNN's selected kernel, not Python eager
+dispatch.
+
+For a native symbol-level trace, collect a CPU profile on the AArch64 machine:
+
+```bash
+ONEDNN_VERBOSE=all DNNL_VERBOSE=1 \
+perf record -g -- \
+  python -m kernels.benchmarks.trace_torch_eager_linear \
+    --op linear \
+    --dtype bfloat16 \
+    --m 1 \
+    --k 2048 \
+    --n 8192 \
+    --threads 1
+
+perf report --stdio | grep -Ei 'aten|addmm|mm|dnnl|acl|matmul|ref'
+```
+
+If verbose says `ref` for BF16 on AArch64, check these first:
+
+- PyTorch build config: the trace script prints `torch.__config__.show()`.
+  Confirm MKLDNN/oneDNN is enabled and whether the build includes ACL support.
+- oneDNN build: the linked oneDNN must be built with AArch64 ACL support and
+  linked to Arm Compute Library.
+- Shape and attributes: `linear` with bias maps to `addmm`; an unsupported bias,
+  post-op, stride, or dtype combination can make oneDNN reject ACL and fall back
+  to reference.
+- ISA support: BF16 ACL matmul needs the hardware, compiler, ACL, oneDNN, and
+  PyTorch build to agree on the available AArch64 BF16/SVE capability.
 
 PyTorch 2.12 native extensions require C++20 headers. On older POSIX compilers
 that implement C++20 under `-std=c++2a`, the loader creates a temporary
